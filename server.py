@@ -155,7 +155,7 @@ def fetch_cutout(url, ra, dec, size_deg):
 # --------------------------------------------------------------------------
 # Перепроєкція вирізки на північ-вгору сітку (щоб епохи співпадали з Gaia)
 # --------------------------------------------------------------------------
-def to_north_up(data, wcs, ra0, dec0, size_deg, n=IMG_SIZE):
+def to_north_up(data, wcs, ra0, dec0, size_deg, n=IMG_SIZE, order=1):
     """
     Ресемплінг у тангенціальну проєкцію: північ вгору, схід (RA↑) ліворуч —
     рівно так, як фронтенд малює Gaia-оверлей і рахує координати кліку.
@@ -179,7 +179,7 @@ def to_north_up(data, wcs, ra0, dec0, size_deg, n=IMG_SIZE):
 
     clean = np.where(np.isfinite(data), data, np.nanmedian(data))
     out = map_coordinates(clean, [np.clip(y, 0, h - 1), np.clip(x, 0, w - 1)],
-                          order=1, mode="nearest")
+                          order=order, mode="nearest")
     out[~valid] = np.nan
     return out, float(valid.mean())
 
@@ -209,6 +209,107 @@ def pick_evenly(items, k):
         return items
     pos = np.linspace(0, len(items) - 1, k).round().astype(int)
     return [items[i] for i in sorted(set(pos))]
+
+
+# --------------------------------------------------------------------------
+# Метадані епохи та прапорці якості (розширення FLAGS у SPHEREx L2)
+# Номери бітів — за IRSA-ноутбуком "Introduction to SPHEREx Spectral Images".
+# --------------------------------------------------------------------------
+FLAG_BITS = {
+    "TRANSIENT": 0, "OVERFLOW": 1, "SUR_ERROR": 2, "NONFUNC": 6, "DICHROIC": 7,
+    "MISSING_DATA": 9, "HOT": 10, "COLD": 11, "FULLSAMPLE": 12, "PHANMISS": 14,
+    "NONLINEAR": 15, "PERSIST": 17, "OUTLIER": 19, "CROSSTALK": 20, "SOURCE": 21,
+    "GHOST": 22, "GHOST_FPA": 23, "GHOST_EXT": 24, "STREAK": 25, "BLOOM": 26,
+    "SNOWBALL": 27, "HALO": 28,
+}
+# Дефекти детектора/обробки (червоний) та артефакти-забруднення (жовтий).
+# SOURCE / DICHROIC / FULLSAMPLE — лише інформаційні, на маску не йдуть.
+DEFECT_FLAGS = ["OVERFLOW", "SUR_ERROR", "NONFUNC", "MISSING_DATA", "HOT", "COLD",
+                "PHANMISS", "NONLINEAR"]
+ARTIFACT_FLAGS = ["TRANSIENT", "PERSIST", "OUTLIER", "CROSSTALK", "GHOST", "GHOST_FPA",
+                  "GHOST_EXT", "STREAK", "BLOOM", "SNOWBALL", "HALO"]
+
+
+def _bitmask(names):
+    return sum(1 << FLAG_BITS[n] for n in names)
+
+
+DEFECT_MASK = _bitmask(DEFECT_FLAGS)
+ARTIFACT_MASK = _bitmask(ARTIFACT_FLAGS)
+
+
+def hdr_get(hdul, key):
+    """Значення ключа з заголовка IMAGE або PRIMARY (або None)."""
+    for h in (hdul["IMAGE"].header, hdul[0].header):
+        v = h.get(key)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def epoch_meta(hdul, wcs, ra, dec):
+    """Метадані кадру: дата, детектор, OBSID, довжина хвилі в цілі, рівень зодіаку."""
+    meta = {}
+    for key, name in (("DATE", "date_obs"), ("DETECTOR", "detector"),
+                      ("OBSID", "obsid"), ("PSF_FWHM", "psf_fwhm")):
+        try:
+            v = hdr_get(hdul, key)
+            if v is not None:
+                meta[name] = v if isinstance(v, (int, float)) else str(v)
+        except Exception:
+            pass
+    try:
+        x, y = wcs.all_world2pix(ra, dec, 0)
+        meta["lambda_um"] = round(wavelength_um(hdul, hdul["IMAGE"].header, x, y), 4)
+    except Exception as e:
+        log.debug("wavelength at target failed: %s", e)
+    try:
+        if "ZODI" in hdul:
+            meta["zodi_mjysr"] = round(float(np.nanmedian(np.array(hdul["ZODI"].data, float))), 3)
+    except Exception:
+        pass
+    return meta
+
+
+def flags_info(hdul, wcs, data_shape, ra, dec, size, n=IMG_SIZE):
+    """
+    Перепроєктує FLAGS на ту саму сітку, що й зображення, і повертає:
+      image  — RGBA-PNG маска (червоне — дефекти, жовте — артефакти),
+      pct    — % площі кадру з кожним прапорцем,
+      center — прапорці в околі цілі (центр кадру).
+    """
+    if "FLAGS" not in hdul:
+        return None
+    fl = np.array(hdul["FLAGS"].data, dtype=float)
+    if fl.shape != data_shape:
+        return None
+    raw, _ = to_north_up(fl, wcs, ra, dec, size, n=n, order=0)
+    valid = np.isfinite(raw)
+    if valid.sum() == 0:
+        return None
+    grid = np.nan_to_num(raw).astype(np.int64)
+
+    pct = {}
+    for name, bit in FLAG_BITS.items():
+        frac = float(((grid >> bit) & 1)[valid].mean())
+        if frac > 0:
+            pct[name] = round(frac * 100, 1)
+
+    c, r = n // 2, max(3, n // 40)
+    patch = grid[c - r:c + r + 1, c - r:c + r + 1]
+    center = [name for name, bit in FLAG_BITS.items()
+              if name != "FULLSAMPLE" and np.any((patch >> bit) & 1)]
+
+    rgba = np.zeros((n, n, 4), np.uint8)
+    rgba[(grid & ARTIFACT_MASK) != 0] = (251, 191, 36, 150)
+    rgba[(grid & DEFECT_MASK) != 0] = (239, 68, 68, 190)
+    buf = io.BytesIO()
+    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", optimize=True)
+    return {
+        "image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
+        "pct": pct,
+        "center": center,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -253,11 +354,20 @@ def api_cutouts():
                 hdu = hdul["IMAGE"]
                 data = np.array(hdu.data, dtype=float)
                 wcs = WCS(hdu.header)
+                # метадані й прапорці читаємо, поки файл відкритий
+                meta = epoch_meta(hdul, wcs, ra, dec)
+                try:
+                    flags = flags_info(hdul, wcs, data.shape, ra, dec, size)
+                except Exception as e:
+                    log.warning("flags failed %s: %s", im["url"], e)
+                    flags = None
             img, cover = to_north_up(data, wcs, ra, dec, size)
             if cover < 0.5:
                 return None
             png = render_png(img, invert)
-            return ({"image": png, "mjd": im["mjd"], "survey": im["band"], "arr": img}
+            meta["version"] = im.get("version")
+            return ({"image": png, "mjd": im["mjd"], "survey": im["band"], "arr": img,
+                     "meta": meta, "flags": flags}
                     if png else None)
         except Exception as e:
             log.warning("cutout failed %s: %s", im["url"], e)
@@ -280,7 +390,8 @@ def api_cutouts():
     results = pick_evenly(results, max_epochs)
     epochs = [
         {"epoch": i + 1, "image": r["image"], "survey": r["survey"],
-         "date": f"{mjd_to_iso(r['mjd'])} (MJD {r['mjd']:.3f})"}
+         "date": f"{mjd_to_iso(r['mjd'])} (MJD {r['mjd']:.3f})",
+         "meta": r["meta"], "flags": r["flags"]}
         for i, r in enumerate(results)
     ]
     return jsonify(epochs=epochs, band=band, total_visits=len(images),

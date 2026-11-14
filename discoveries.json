@@ -1,0 +1,29 @@
+[
+  {
+    "id": "SPX-355847",
+    "observer": "Citizen_Astronomer",
+    "type": "Brown Dwarf Candidate",
+    "coords": "269.45210°, 4.69340°",
+    "displacement": "Візуально (Blink)",
+    "distance": "FOV 0.18°",
+    "date": "2026-11-14"
+  },
+  {
+    "id": "SPX-359327",
+    "observer": "Citizen_Astronomer",
+    "type": "Solar System / Asteroid / Comet",
+    "coords": "269.45210°, 4.69340°",
+    "displacement": "Візуально (Blink)",
+    "distance": "FOV 0.18°",
+    "date": "2026-11-14"
+  },
+  {
+    "id": "SPX-536504",
+    "observer": "Citizen_Astronomer",
+    "type": "Variable / Transient",
+    "coords": "76.95650°, 30.40140°",
+    "displacement": "Візуально (Blink)",
+    "distance": "FOV 0.04°",
+    "date": "2026-11-14"
+  }
+]
