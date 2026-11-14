@@ -144,6 +144,11 @@
         </label>
 
         <label class="flex items-center justify-between text-xs text-slate-300 cursor-pointer">
+          <span>Режим додавання (Σ усіх епох, вищий S/N)</span>
+          <input id="sumToggle" type="checkbox" onchange="updateFrameDisplay()" class="accent-emerald-400" />
+        </label>
+
+        <label class="flex items-center justify-between text-xs text-slate-300 cursor-pointer">
           <span>Центральне перехрестя</span>
           <input id="crosshairToggle" type="checkbox" checked onchange="toggleCrosshair()" class="accent-cyan-400" />
         </label>
@@ -273,6 +278,7 @@
   <script>
     // Глобальний стан додатку
     let epochs = [];
+    let stackData = null;   // { image, n_frames } — сума всіх епох з бекенду
     let currentFrameIndex = 0;
     let isPlaying = true;
     let blinkInterval = null;
@@ -381,6 +387,7 @@
         const cutoutsData = await cutoutsRes.json();
 
         epochs = (cutoutsData.epochs || []).filter(e => e.image);
+        stackData = cutoutsData.stack && cutoutsData.stack.image ? cutoutsData.stack : null;
         currentFrameIndex = 0;
         // У режимі «Авто» показуємо, який детектор обрав бекенд
         if (!band && cutoutsData.band) {
@@ -434,11 +441,27 @@
       const curImg = document.getElementById('currentEpochImg');
       const baseImg = document.getElementById('baseEpochImg');
       const diffMode = document.getElementById('diffToggle').checked;
+      const sumMode = document.getElementById('sumToggle').checked;
 
       if (epochs.length === 0) {
         curImg.classList.add('hidden');
         baseImg.classList.add('hidden');
         document.getElementById('epochBadge').textContent = '0 кадрів';
+        return;
+      }
+
+      // Режим додавання: показуємо усереднений кадр з бекенду (діє замість віднімання)
+      if (sumMode && stackData) {
+        curImg.src = stackData.image;
+        curImg.classList.remove('hidden', 'diff-layer');
+        baseImg.classList.add('hidden');
+        document.getElementById('epochBadge').textContent = `Σ сума ${stackData.n_frames} кадрів`;
+        document.getElementById('epochMeta').textContent =
+          'Усереднення всіх епох (фон віднято): слабкі статичні джерела яскравіші, рухомі — розмазані.';
+        epochs.forEach((_, idx) => {
+          const b = document.getElementById(`frameBtn_${idx}`);
+          if (b) b.className = 'py-1.5 px-2 rounded text-xs font-mono border bg-slate-950 border-slate-800 text-slate-500';
+        });
         return;
       }
 

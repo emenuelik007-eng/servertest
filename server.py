@@ -256,7 +256,8 @@ def api_cutouts():
             if cover < 0.5:
                 return None
             png = render_png(img, invert)
-            return {"image": png, "mjd": im["mjd"], "survey": im["band"]} if png else None
+            return ({"image": png, "mjd": im["mjd"], "survey": im["band"], "arr": img}
+                    if png else None)
         except Exception as e:
             log.warning("cutout failed %s: %s", im["url"], e)
             return None
@@ -264,13 +265,25 @@ def api_cutouts():
     with ThreadPoolExecutor(WORKERS) as ex:
         results = [r for r in ex.map(work, candidates) if r]
 
+    # Сума (середнє) усіх вдалих кадрів: кожен кадр спершу очищається від фону
+    # (медіана), потім усереднюється — зростає S/N для слабких статичних джерел.
+    # Рухомі об'єкти при цьому розмазуються (видно як «хвіст» між епохами).
+    stack_png, stack_n = None, 0
+    if results:
+        frames = np.stack([r["arr"] - np.nanmedian(r["arr"]) for r in results])
+        with np.errstate(all="ignore"):
+            stacked = np.nanmean(frames, axis=0)
+        stack_png = render_png(stacked, invert)
+        stack_n = len(results)
+
     results = pick_evenly(results, max_epochs)
     epochs = [
         {"epoch": i + 1, "image": r["image"], "survey": r["survey"],
          "date": f"{mjd_to_iso(r['mjd'])} (MJD {r['mjd']:.3f})"}
         for i, r in enumerate(results)
     ]
-    return jsonify(epochs=epochs, band=band, total_visits=len(images))
+    return jsonify(epochs=epochs, band=band, total_visits=len(images),
+                   stack={"image": stack_png, "n_frames": stack_n} if stack_png else None)
 
 
 # --------------------------------------------------------------------------
