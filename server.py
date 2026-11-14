@@ -8,7 +8,7 @@ SPHEREx Sky Blinker — бекенд.
   * Gaia DR3 — ESA Gaia TAP (резерв: VizieR TAP)
 
 Ендпоінти (під фронтенд index.html):
-  GET  /api/cutouts?ra=&dec=&radius_deg=&invert=&band=&max_epochs=
+  GET  /api/cutouts?ra=&dec=&radius_deg=&invert=&band=&max_epochs=&lam_min=&lam_max=
   GET  /api/gaia?ra=&dec=&radius_deg=
   GET  /api/wise?ra=&dec=&radius_deg=
   GET  /api/sed?ra=&dec=&max=
@@ -25,7 +25,10 @@ import json
 import logging
 import math
 import os
+import re
 import threading
+import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
@@ -57,6 +60,10 @@ SED_CUTOUT_DEG = 0.02     # розмір вирізки для спектру (~
 SED_DEFAULT_MAX = 48      # максимум знімків для одного спектру (кожен ~ кілька МБ)
 HTTP_TIMEOUT = 180
 WORKERS = 6
+MAX_EPOCHS_LIMIT = 32            # верхня межа max_epochs
+SED_MAX_LIMIT = 96               # верхня межа max для /api/sed
+MAX_RADIUS_DEG = 0.5             # верхня межа radius_deg
+CACHE_MAX_BYTES = 2 * 1024 ** 3  # ~2 ГБ дискового кешу
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -81,20 +88,68 @@ def tap_query(url, adql, timeout=HTTP_TIMEOUT):
     return list(csv.DictReader(io.StringIO(r.text)))
 
 
+_cache_lock = threading.Lock()
+_cache_writes = 0
+
+
+def _looks_like_fits(data):
+    return data.startswith((b"SIMPLE", b"\x1f\x8b"))  # FITS або gzip-FITS
+
+
+def _prune_cache():
+    """Видаляє найстаріші файли кешу, якщо він перевищив CACHE_MAX_BYTES."""
+    try:
+        files = []
+        for e in os.scandir(CACHE_DIR):
+            if e.is_file() and e.name.endswith(".fits"):
+                st = e.stat()
+                files.append((st.st_mtime, st.st_size, e.path))
+        total = sum(f[1] for f in files)
+        for _, size, p in sorted(files):
+            if total <= CACHE_MAX_BYTES:
+                break
+            try:
+                os.remove(p)
+                total -= size
+            except OSError:
+                pass
+    except OSError as e:
+        log.debug("cache prune failed: %s", e)
+
+
 def cached_get(url, params=None):
-    """Завантажує файл (з дисковим кешем) і повертає bytes."""
+    """Завантажує FITS (з дисковим кешем) і повертає bytes. HTML-помилки з кодом 200 не кешуються."""
+    global _cache_writes
     key = hashlib.sha1((url + json.dumps(params or {}, sort_keys=True)).encode()).hexdigest()
     path = os.path.join(CACHE_DIR, key + ".fits")
     if os.path.exists(path):
-        with open(path, "rb") as f:
-            return f.read()
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            if _looks_like_fits(data):
+                return data
+        except OSError:
+            pass
+        try:  # пошкоджений запис кешу — видаляємо й качаємо знову
+            os.remove(path)
+        except OSError:
+            pass
     r = http.get(url, params=params, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
-    tmp = path + ".part"
+    data = r.content
+    if not _looks_like_fits(data):
+        raise ValueError(f"відповідь не є FITS ({r.headers.get('Content-Type', '?')}): {data[:80]!r}")
+    # унікальне ім'я tmp: паралельні потоки/процеси не псують один одного
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.part"
     with open(tmp, "wb") as f:
-        f.write(r.content)
+        f.write(data)
     os.replace(tmp, path)
-    return r.content
+    with _cache_lock:
+        _cache_writes += 1
+        do_prune = _cache_writes % 20 == 0
+    if do_prune:
+        _prune_cache()
+    return data
 
 
 def mjd_to_iso(mjd):
@@ -109,6 +164,45 @@ def f_or_none(x):
         return None
 
 
+BAND_RE = re.compile(r"[A-Za-z0-9_.\-]{1,40}")
+
+
+def parse_band(value):
+    """Назва смуги йде в ADQL — пропускаємо лише безпечні символи."""
+    if not value:
+        return None
+    if not BAND_RE.fullmatch(value):
+        raise ValueError("bad band name")
+    return value
+
+
+def parse_coords(args):
+    """(ra, dec) у градусах; KeyError/ValueError → 400."""
+    ra, dec = float(args["ra"]), float(args["dec"])
+    if not (math.isfinite(ra) and math.isfinite(dec)):
+        raise ValueError("ra/dec must be finite numbers")
+    if not -90.0 <= dec <= 90.0:
+        raise ValueError("dec must be within [-90, 90]")
+    return ra % 360.0, dec
+
+
+def parse_radius(args, default=0.06):
+    r = float(args.get("radius_deg", default))
+    if not math.isfinite(r) or r <= 0:
+        raise ValueError("radius_deg must be a positive number")
+    return min(r, MAX_RADIUS_DEG)
+
+
+def parse_int(args, name, default, lo, hi):
+    return max(lo, min(int(args.get(name, default)), hi))
+
+
+def _version_key(v):
+    """'10.1' > '9.3' (числове, а не лексикографічне порівняння версій)."""
+    v = v or ""
+    return (tuple(int(n) for n in re.findall(r"\d+", v)), v)
+
+
 # --------------------------------------------------------------------------
 # SPHEREx: пошук знімків, що покривають точку
 # --------------------------------------------------------------------------
@@ -118,6 +212,7 @@ def find_spherex_images(ra, dec, band=None):
     Дублі (та сама експозиція в різних версіях обробки/релізах) відсіюються —
     лишається найновіша версія.
     """
+    band = parse_band(band)
     band_clause = f"AND p.energy_bandpassname = '{band}'" if band else ""
     adql = f"""
         SELECT a.uri AS uri,
@@ -126,7 +221,7 @@ def find_spherex_images(ra, dec, band=None):
                p.provenance_version AS version
         FROM spherex.artifact a
         JOIN spherex.plane p ON a.planeid = p.planeid
-        WHERE 1 = CONTAINS(POINT('ICRS', {ra}, {dec}), p.poly)
+        WHERE 1 = CONTAINS(POINT('ICRS', {ra:.7f}, {dec:.7f}), p.poly)
         {band_clause}
         ORDER BY p.time_bounds_lower
     """
@@ -137,7 +232,7 @@ def find_spherex_images(ra, dec, band=None):
         if mjd is None or not r.get("uri"):
             continue
         key = (round(mjd, 4), r["band"])
-        if key not in best or (r.get("version") or "") > (best[key].get("version") or ""):
+        if key not in best or _version_key(r.get("version")) > _version_key(best[key].get("version")):
             best[key] = {
                 "url": IRSA_BASE + r["uri"].lstrip("/"),
                 "mjd": mjd,
@@ -173,12 +268,15 @@ def to_north_up(data, wcs, ra0, dec0, size_deg, n=IMG_SIZE, order=1):
         ra = a0 + np.arctan2(xi * sinc, rho * np.cos(d0) * cosc - eta * np.sin(d0) * sinc)
     ra_deg, dec_deg = np.degrees(ra) % 360.0, np.degrees(dec)
 
-    x, y = wcs.all_world2pix(ra_deg, dec_deg, 0)
     h, w = data.shape
+    if not np.isfinite(data).any():
+        return np.full((n, n), np.nan), 0.0
+    x, y = wcs.all_world2pix(ra_deg, dec_deg, 0)
     valid = (x >= 0) & (x <= w - 1) & (y >= 0) & (y <= h - 1) & np.isfinite(x) & np.isfinite(y)
 
     clean = np.where(np.isfinite(data), data, np.nanmedian(data))
-    out = map_coordinates(clean, [np.clip(y, 0, h - 1), np.clip(x, 0, w - 1)],
+    out = map_coordinates(clean, [np.clip(np.nan_to_num(y), 0, h - 1),
+                                  np.clip(np.nan_to_num(x), 0, w - 1)],
                           order=order, mode="nearest")
     out[~valid] = np.nan
     return out, float(valid.mean())
@@ -200,7 +298,7 @@ def render_png(img, invert):
         arr = 255 - arr
         arr[~ok] = 255
     buf = io.BytesIO()
-    Image.fromarray(arr, "L").save(buf, format="PNG", optimize=True)
+    Image.fromarray(arr).save(buf, format="PNG", optimize=True)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
@@ -250,22 +348,34 @@ def hdr_get(hdul, key):
 def epoch_meta(hdul, wcs, ra, dec):
     """Метадані кадру: дата, детектор, OBSID, довжина хвилі в цілі, рівень зодіаку."""
     meta = {}
-    for key, name in (("DATE", "date_obs"), ("DETECTOR", "detector"),
-                      ("OBSID", "obsid"), ("PSF_FWHM", "psf_fwhm")):
+    # DATE за стандартом FITS — дата створення файлу; час спостереження — DATE-OBS.
+    for key, name in (("DATE-OBS", "date_obs"), ("DATE", "date_created"),
+                      ("DETECTOR", "detector"), ("OBSID", "obsid"), ("PSF_FWHM", "psf_fwhm")):
         try:
             v = hdr_get(hdul, key)
-            if v is not None:
-                meta[name] = v if isinstance(v, (int, float)) else str(v)
+            if v is None:
+                continue
+            if isinstance(v, (int, float)):
+                v = f_or_none(v)  # NaN/inf дали б невалідний JSON
+                if v is None:
+                    continue
+            else:
+                v = str(v)
+            meta[name] = v
         except Exception:
             pass
     try:
         x, y = wcs.all_world2pix(ra, dec, 0)
-        meta["lambda_um"] = round(wavelength_um(hdul, hdul["IMAGE"].header, x, y), 4)
+        lam = f_or_none(wavelength_um(hdul, hdul["IMAGE"].header, x, y))
+        if lam is not None:
+            meta["lambda_um"] = round(lam, 4)
     except Exception as e:
         log.debug("wavelength at target failed: %s", e)
     try:
         if "ZODI" in hdul:
-            meta["zodi_mjysr"] = round(float(np.nanmedian(np.array(hdul["ZODI"].data, float))), 3)
+            z = f_or_none(np.nanmedian(np.array(hdul["ZODI"].data, float)))
+            if z is not None:
+                meta["zodi_mjysr"] = round(z, 3)
     except Exception:
         pass
     return meta
@@ -304,11 +414,13 @@ def flags_info(hdul, wcs, data_shape, ra, dec, size, n=IMG_SIZE):
     rgba[(grid & ARTIFACT_MASK) != 0] = (251, 191, 36, 150)
     rgba[(grid & DEFECT_MASK) != 0] = (239, 68, 68, 190)
     buf = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", optimize=True)
+    Image.fromarray(rgba).save(buf, format="PNG", optimize=True)
     return {
         "image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
         "pct": pct,
         "center": center,
+        # внутрішнє (не для JSON — api_cutouts його забирає): піксельна маска для стека
+        "_bad": (grid & (DEFECT_MASK | ARTIFACT_MASK)) != 0,
     }
 
 
@@ -318,12 +430,15 @@ def flags_info(hdul, wcs, data_shape, ra, dec, size, n=IMG_SIZE):
 @app.get("/api/cutouts")
 def api_cutouts():
     try:
-        ra = float(request.args["ra"])
-        dec = float(request.args["dec"])
-        fov = float(request.args.get("radius_deg", 0.06))
-        invert = request.args.get("invert", "true").lower() == "true"
-        band = request.args.get("band")  # напр. SPHEREx-D2
-        max_epochs = int(request.args.get("max_epochs", DEFAULT_MAX_EPOCHS))
+        ra, dec = parse_coords(request.args)
+        fov = parse_radius(request.args)
+        invert = request.args.get("invert", "true").lower() in ("1", "true", "yes")
+        band = parse_band(request.args.get("band"))  # напр. SPHEREx-D2
+        max_epochs = parse_int(request.args, "max_epochs", DEFAULT_MAX_EPOCHS, 1, MAX_EPOCHS_LIMIT)
+        # Необов'язковий фільтр за довжиною хвилі в цілі (µm). У межах одного детектора λ
+        # змінюється від візиту до візиту, тож без фільтра кадри блінку можуть бути на різних λ.
+        lam_min = f_or_none(request.args.get("lam_min"))
+        lam_max = f_or_none(request.args.get("lam_max"))
     except (KeyError, ValueError) as e:
         return jsonify(error=f"bad parameters: {e}"), 400
 
@@ -335,7 +450,8 @@ def api_cutouts():
         return jsonify(error=f"IRSA TAP error: {e}"), 502
 
     if not images:
-        return jsonify(epochs=[], note="SPHEREx не покриває цю точку (або дані ще не завантажені)")
+        return jsonify(epochs=[], size_deg=size,
+                       note="SPHEREx не покриває цю точку (або дані ще не завантажені)")
 
     # Для блінку беремо ОДИН детектор/смугу — із найбільшою кількістю повторних візитів,
     # інакше різні довжини хвилі дають хибні "зміни яскравості".
@@ -346,7 +462,9 @@ def api_cutouts():
         band = max(counts, key=counts.get)
         images = [im for im in images if im["band"] == band]
 
-    candidates = pick_evenly(images, max_epochs + 4)  # запас на невдалі/крайові кадри
+    lam_filter = lam_min is not None or lam_max is not None
+    # запас на невдалі/крайові кадри (і на кадри, відсіяні фільтром за λ)
+    candidates = pick_evenly(images, 3 * max_epochs + 4 if lam_filter else max_epochs + 4)
 
     def work(im):
         try:
@@ -361,13 +479,19 @@ def api_cutouts():
                 except Exception as e:
                     log.warning("flags failed %s: %s", im["url"], e)
                     flags = None
+            bad = flags.pop("_bad") if flags else None
+            if lam_filter:
+                lam = meta.get("lambda_um")
+                if lam is None or (lam_min is not None and lam < lam_min) \
+                        or (lam_max is not None and lam > lam_max):
+                    return None
             img, cover = to_north_up(data, wcs, ra, dec, size)
             if cover < 0.5:
                 return None
             png = render_png(img, invert)
             meta["version"] = im.get("version")
             return ({"image": png, "mjd": im["mjd"], "survey": im["band"], "arr": img,
-                     "meta": meta, "flags": flags}
+                     "bad": bad, "meta": meta, "flags": flags}
                     if png else None)
         except Exception as e:
             log.warning("cutout failed %s: %s", im["url"], e)
@@ -376,14 +500,20 @@ def api_cutouts():
     with ThreadPoolExecutor(WORKERS) as ex:
         results = [r for r in ex.map(work, candidates) if r]
 
-    # Сума (середнє) усіх вдалих кадрів: кожен кадр спершу очищається від фону
-    # (медіана), потім усереднюється — зростає S/N для слабких статичних джерел.
-    # Рухомі об'єкти при цьому розмазуються (видно як «хвіст» між епохами).
+    # Середнє всіх вдалих кадрів: кожен кадр спершу очищається від фону (медіана) і від
+    # пікселів з прапорцями дефектів/артефактів, потім усереднюється — зростає S/N для слабких
+    # статичних джерел. Рухомі об'єкти при цьому розмазуються (видно як «хвіст» між епохами).
     stack_png, stack_n = None, 0
     if results:
-        frames = np.stack([r["arr"] - np.nanmedian(r["arr"]) for r in results])
-        with np.errstate(all="ignore"):
-            stacked = np.nanmean(frames, axis=0)
+        frames = []
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for r in results:
+                a = r["arr"].copy()
+                if r["bad"] is not None:
+                    a[r["bad"]] = np.nan
+                frames.append(a - np.nanmedian(a))
+            stacked = np.nanmean(np.stack(frames), axis=0)
         stack_png = render_png(stacked, invert)
         stack_n = len(results)
 
@@ -394,7 +524,9 @@ def api_cutouts():
          "meta": r["meta"], "flags": r["flags"]}
         for i, r in enumerate(results)
     ]
-    return jsonify(epochs=epochs, band=band, total_visits=len(images),
+    # size_deg — ФАКТИЧНИЙ розмір кадру (після обрізання radius_deg до 0.01–0.5°):
+    # фронтенд має малювати Gaia/WISE-оверлеї саме за ним.
+    return jsonify(epochs=epochs, band=band, size_deg=size, total_visits=len(images),
                    stack={"image": stack_png, "n_frames": stack_n} if stack_png else None)
 
 
@@ -404,45 +536,42 @@ def api_cutouts():
 @app.get("/api/gaia")
 def api_gaia():
     try:
-        ra = float(request.args["ra"])
-        dec = float(request.args["dec"])
-        r = float(request.args.get("radius_deg", 0.06)) * 1.5  # з запасом на кути кадру
+        ra, dec = parse_coords(request.args)
+        r = parse_radius(request.args) * 1.5  # з запасом на кути кадру
     except (KeyError, ValueError) as e:
-        return jsonify(error=str(e)), 400
+        return jsonify(error=str(e), stars=[]), 400
 
-    stars = []
+    def to_star(row, k_id, k_ra, k_dec, k_pmra, k_pmdec, k_mag):
+        mag = f_or_none(row[k_mag])
+        return {
+            "source_id": row[k_id],
+            "ra": float(row[k_ra]), "dec": float(row[k_dec]),
+            # None = у Gaia немає власного руху (2-параметричне рішення), а не «рух = 0»
+            "pmra": f_or_none(row[k_pmra]), "pmdec": f_or_none(row[k_pmdec]),
+            "mag": 99.0 if mag is None else mag,
+        }
+
     try:
         adql = f"""
             SELECT TOP 800 source_id, ra, dec, pmra, pmdec, phot_g_mean_mag
             FROM gaiadr3.gaia_source
-            WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra}, {dec}, {r}))
+            WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra:.7f}, {dec:.7f}, {r:.7f}))
             ORDER BY phot_g_mean_mag ASC
         """
-        for row in tap_query(GAIA_TAP, adql, timeout=60):
-            stars.append({
-                "source_id": row["source_id"],
-                "ra": float(row["ra"]), "dec": float(row["dec"]),
-                "pmra": f_or_none(row["pmra"]) or 0.0,
-                "pmdec": f_or_none(row["pmdec"]) or 0.0,
-                "mag": f_or_none(row["phot_g_mean_mag"]) or 99.0,
-            })
+        # список збирається повністю або не збирається взагалі — без дублів при фолбеку
+        stars = [to_star(row, "source_id", "ra", "dec", "pmra", "pmdec", "phot_g_mean_mag")
+                 for row in tap_query(GAIA_TAP, adql, timeout=60)]
     except Exception as e:
         log.warning("ESA Gaia failed (%s), trying VizieR", e)
         try:
             adql = f"""
                 SELECT TOP 800 Source, RA_ICRS, DE_ICRS, pmRA, pmDE, Gmag
                 FROM "I/355/gaiadr3"
-                WHERE 1 = CONTAINS(POINT('ICRS', RA_ICRS, DE_ICRS), CIRCLE('ICRS', {ra}, {dec}, {r}))
+                WHERE 1 = CONTAINS(POINT('ICRS', RA_ICRS, DE_ICRS), CIRCLE('ICRS', {ra:.7f}, {dec:.7f}, {r:.7f}))
                 ORDER BY Gmag ASC
             """
-            for row in tap_query(VIZIER_TAP, adql, timeout=60):
-                stars.append({
-                    "source_id": row["Source"],
-                    "ra": float(row["RA_ICRS"]), "dec": float(row["DE_ICRS"]),
-                    "pmra": f_or_none(row["pmRA"]) or 0.0,
-                    "pmdec": f_or_none(row["pmDE"]) or 0.0,
-                    "mag": f_or_none(row["Gmag"]) or 99.0,
-                })
+            stars = [to_star(row, "Source", "RA_ICRS", "DE_ICRS", "pmRA", "pmDE", "Gmag")
+                     for row in tap_query(VIZIER_TAP, adql, timeout=60)]
         except Exception as e2:
             return jsonify(error=f"Gaia unavailable: {e2}", stars=[]), 502
     return jsonify(stars=stars)
@@ -454,9 +583,8 @@ def api_gaia():
 @app.get("/api/wise")
 def api_wise():
     try:
-        ra = float(request.args["ra"])
-        dec = float(request.args["dec"])
-        r = float(request.args.get("radius_deg", 0.06)) * 1.5
+        ra, dec = parse_coords(request.args)
+        r = parse_radius(request.args) * 1.5
     except (KeyError, ValueError) as e:
         return jsonify(error=str(e), sources=[]), 400
 
@@ -465,7 +593,7 @@ def api_wise():
         return f"""
             SELECT TOP 800 {cols}
             FROM allwise_p3as_psd
-            WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra}, {dec}, {r}))
+            WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra:.7f}, {dec:.7f}, {r:.7f}))
             ORDER BY w2mpro ASC
         """
 
@@ -488,8 +616,8 @@ def api_wise():
                 "ra": float(row["ra"]), "dec": float(row["dec"]),
                 "w1": f_or_none(row.get("w1mpro")),
                 "w2": f_or_none(row.get("w2mpro")),
-                "pmra": f_or_none(row.get("pmra")) or 0.0,
-                "pmdec": f_or_none(row.get("pmdec")) or 0.0,
+                "pmra": f_or_none(row.get("pmra")),    # None = власний рух не виміряно
+                "pmdec": f_or_none(row.get("pmdec")),
                 "sigpmra": f_or_none(row.get("sigpmra")),
                 "sigpmdec": f_or_none(row.get("sigpmdec")),
             })
@@ -515,7 +643,12 @@ def wavelength_um(hdul, header, x, y):
 
 
 def photometry_point(url, ra, dec):
-    """Потік (mJy) у точці: сума 3×3 мінус фон, × тілесний кут пікселя."""
+    """
+    Потік (mJy) у точці: сума 3×3 пікселі мінус фон, × тілесний кут пікселя.
+    Фон — медіана вирізки ПОЗА апертурою; пікселі з прапорцями дефектів/артефактів
+    маскуються (їх кількість у апертурі повертається). Апертурної корекції немає,
+    тож потік занижений.  Повертає (λ_µm, flux_mJy, n_flagged) або None.
+    """
     with fetch_cutout(url, ra, dec, SED_CUTOUT_DEG) as hdul:
         hdu = hdul["IMAGE"]
         data = np.array(hdu.data, dtype=float)  # MJy/sr
@@ -524,24 +657,34 @@ def photometry_point(url, ra, dec):
         h, w = data.shape
         if not (0 <= x < w and 0 <= y < h):
             return None
+        bad = np.zeros(data.shape, bool)
+        if "FLAGS" in hdul:
+            fl = np.array(hdul["FLAGS"].data, dtype=float)
+            if fl.shape == data.shape:
+                bad = (np.nan_to_num(fl).astype(np.int64) & (DEFECT_MASK | ARTIFACT_MASK)) != 0
         xi, yi = int(round(float(x))), int(round(float(y)))
         y0, y1, x0, x1 = max(yi - 1, 0), min(yi + 2, h), max(xi - 1, 0), min(xi + 2, w)
         patch = data[y0:y1, x0:x1]
-        if not np.isfinite(patch).any():
+        good = np.isfinite(patch) & ~bad[y0:y1, x0:x1]
+        if not good.any():
             return None
-        bkg = np.nanmedian(data)
+        outside = np.isfinite(data) & ~bad
+        outside[y0:y1, x0:x1] = False
+        if not outside.any():
+            return None
+        bkg = float(np.median(data[outside]))
         scales = proj_plane_pixel_scales(wcs)  # deg/pix
         omega = (scales[0] * scales[1]) * (math.pi / 180.0) ** 2  # sr/pix
-        flux_mjy = float(np.nansum(patch - bkg)) * omega * 1e9  # MJy → mJy
-        return wavelength_um(hdul, hdu.header, x, y), flux_mjy
+        flux_mjy = float(np.sum(patch[good] - bkg)) * omega * 1e9  # MJy → mJy
+        n_flagged = int(good.size - good.sum())
+        return wavelength_um(hdul, hdu.header, x, y), flux_mjy, n_flagged
 
 
 @app.get("/api/sed")
 def api_sed():
     try:
-        ra = float(request.args["ra"])
-        dec = float(request.args["dec"])
-        max_n = int(request.args.get("max", SED_DEFAULT_MAX))
+        ra, dec = parse_coords(request.args)
+        max_n = parse_int(request.args, "max", SED_DEFAULT_MAX, 1, SED_MAX_LIMIT)
     except (KeyError, ValueError) as e:
         return jsonify(found=False, error=str(e)), 400
 
@@ -563,28 +706,52 @@ def api_sed():
             return None
 
     with ThreadPoolExecutor(WORKERS) as ex:
-        pts = [p for p in ex.map(work, chosen) if p and math.isfinite(p[0])]
+        pts = [p for p in ex.map(work, chosen)
+               if p and f_or_none(p[0]) is not None and f_or_none(p[1]) is not None]
 
     pts.sort(key=lambda p: p[0])
     return jsonify(
         found=bool(pts),
         designation=f"SPHEREx @ {ra:.5f}, {dec:+.5f}",
         n_images_covering=len(images),
-        bands=[{"wavelength_um": round(w, 4), "flux_mjy": f} for w, f in pts],
+        method="3x3 px box; background = median outside aperture; flagged pixels masked; "
+               "no aperture correction (flux is a lower limit)",
+        bands=[{"wavelength_um": round(lam, 4), "flux_mjy": f, "n_flagged_px": nf}
+               for lam, f, nf in pts],
     )
 
 
 # --------------------------------------------------------------------------
 # /api/discoveries — простий JSON-журнал
 # --------------------------------------------------------------------------
-_lock = threading.Lock()
+_lock = threading.Lock()  # захищає лише потоки одного процесу → запускайте один процес
 
 
 def _read_discoveries():
     if not os.path.exists(DISCOVERIES_FILE):
         return []
-    with open(DISCOVERIES_FILE, encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(DISCOVERIES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError("очікувався JSON-масив")
+        return data
+    except ValueError as e:  # JSONDecodeError та UnicodeDecodeError — підкласи ValueError
+        backup = f"{DISCOVERIES_FILE}.corrupt-{int(time.time())}"
+        log.error("discoveries.json пошкоджено (%s) — збережено як %s", e, backup)
+        try:
+            os.replace(DISCOVERIES_FILE, backup)
+        except OSError:
+            pass
+        return []
+
+
+def _write_discoveries(data):
+    """Атомарний запис: збій посеред нього не псує існуючий файл."""
+    tmp = f"{DISCOVERIES_FILE}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DISCOVERIES_FILE)
 
 
 @app.get("/api/discoveries")
@@ -595,7 +762,9 @@ def get_discoveries():
 
 @app.post("/api/discoveries")
 def post_discovery():
-    item = request.get_json(silent=True) or {}
+    item = request.get_json(silent=True)
+    if not isinstance(item, dict):
+        return jsonify(error="JSON object expected"), 400
     required = ("observer", "type", "coords")
     if not all(item.get(k) for k in required):
         return jsonify(error=f"required: {required}"), 400
@@ -604,8 +773,7 @@ def post_discovery():
     with _lock:
         data = _read_discoveries()
         data.append(clean)
-        with open(DISCOVERIES_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _write_discoveries(data)
     return jsonify(ok=True), 201
 
 
@@ -618,4 +786,5 @@ def index():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), threaded=True)
+    app.run(host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", 8000)),
+            threaded=True)
