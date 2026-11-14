@@ -1,273 +1,446 @@
+"""
+SPHEREx Sky Blinker — бекенд.
+
+Дані:
+  * SPHEREx Quick Release (QR2/QR3...) — NASA/IPAC IRSA
+      - пошук знімків: TAP (таблиці spherex.artifact + spherex.plane)
+      - вирізки (cutouts): IRSA cutout-сервіс (?center=RA,DEC&size=deg до URL FITS-файлу)
+  * Gaia DR3 — ESA Gaia TAP (резерв: VizieR TAP)
+
+Ендпоінти (під фронтенд index.html):
+  GET  /api/cutouts?ra=&dec=&radius_deg=&invert=&band=&max_epochs=
+  GET  /api/gaia?ra=&dec=&radius_deg=
+  GET  /api/sed?ra=&dec=&max=
+  GET  /api/discoveries
+  POST /api/discoveries
+
+Запуск:  pip install -r requirements.txt && python server.py
+"""
+import base64
+import csv
+import hashlib
 import io
 import json
-import base64
-from pathlib import Path
+import logging
+import math
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 import numpy as np
 import requests
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
-from astroquery.skyview import SkyView
 from astropy import units as u
-from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.nddata import Cutout2D
-from astropy.table import Table
 from astropy.wcs import WCS
-from astropy.visualization import ZScaleInterval, AsinhStretch, ImageNormalize
-from astroquery.gaia import Gaia
-from astroquery.ipac.irsa import Irsa
+from astropy.wcs.utils import proj_plane_pixel_scales
+from flask import Flask, jsonify, request, send_from_directory
+from PIL import Image
+from scipy.ndimage import map_coordinates
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# --------------------------------------------------------------------------
+# Налаштування
+# --------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(BASE_DIR, ".cache")
+DISCOVERIES_FILE = os.path.join(BASE_DIR, "discoveries.json")
 
-app = FastAPI(title="SPHEREx DR3 & Planet X Hunter API")
+IRSA_BASE = "https://irsa.ipac.caltech.edu/"
+IRSA_TAP = "https://irsa.ipac.caltech.edu/TAP/sync"
+GAIA_TAP = "https://gea.esac.esa.int/tap-server/tap/sync"
+VIZIER_TAP = "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+IMG_SIZE = 256            # розмір вихідних PNG (px)
+DEFAULT_MAX_EPOCHS = 8    # скільки кадрів віддавати в блінк
+SED_CUTOUT_DEG = 0.02     # розмір вирізки для спектру (~10 пікселів SPHEREx)
+SED_DEFAULT_MAX = 48      # максимум знімків для одного спектру (кожен ~ кілька МБ)
+HTTP_TIMEOUT = 180
+WORKERS = 6
 
-BASE_DIR = Path(__file__).resolve().parent
-CACHE_DIR = BASE_DIR / "cache"
-CACHE_DIR.mkdir(exist_ok=True)
-DISCOVERIES_FILE = BASE_DIR / "discoveries.json"
+os.makedirs(CACHE_DIR, exist_ok=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("spherex")
 
-# URL сервісів NASA/IPAC IRSA для даних SPHEREx
-IRSA_SIA_URL = "https://irsa.ipac.caltech.edu/SIA"
-IRSA_TAP_URL = "https://irsa.ipac.caltech.edu/TAP"
-
-
-class DiscoveryItem(BaseModel):
-    id: str
-    observer: str
-    type: str
-    coords: str
-    displacement: str
-    distance: str
-    date: str
+app = Flask(__name__, static_folder=None)
+http = requests.Session()
+http.headers["User-Agent"] = "SPHEREx-Sky-Blinker/1.0 (hackathon)"
 
 
-def array_to_base64_png(data: np.ndarray, invert: bool = True) -> str:
-    """Конвертує 2D-масив пікселів FITS у Base64 PNG з нормалізацією ZScale."""
-    clean_data = np.nan_to_num(data, nan=np.nanmedian(data))
-    norm = ImageNormalize(clean_data, interval=ZScaleInterval(), stretch=AsinhStretch())
-
-    fig, ax = plt.subplots(figsize=(4, 4), dpi=100)
-    cmap = "gray_r" if invert else "gray"
-    ax.imshow(clean_data, norm=norm, cmap=cmap, origin="lower")
-    ax.axis("off")
-    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
-    plt.close(fig)
-    buf.seek(0)
-    return "data:image/png;base64," + base64.b64encode(buf.read()).decode("utf-8")
+# --------------------------------------------------------------------------
+# Допоміжне: TAP, кеш, час
+# --------------------------------------------------------------------------
+def tap_query(url, adql, timeout=HTTP_TIMEOUT):
+    """Синхронний TAP-запит, повертає список словників (CSV)."""
+    r = http.post(
+        url,
+        data={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return list(csv.DictReader(io.StringIO(r.text)))
 
 
-# 1. Віддача головної HTML-сторінки
-@app.get("/")
-async def serve_frontend():
-    html_path = BASE_DIR / "index.html"
-    if not html_path.exists():
-        html_path = BASE_DIR / "index(2).html"
-    if not html_path.exists():
-        raise HTTPException(status_code=404, detail="HTML файл не знайдено поруч із server.py")
-    return FileResponse(html_path)
+def cached_get(url, params=None):
+    """Завантажує файл (з дисковим кешем) і повертає bytes."""
+    key = hashlib.sha1((url + json.dumps(params or {}, sort_keys=True)).encode()).hexdigest()
+    path = os.path.join(CACHE_DIR, key + ".fits")
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return f.read()
+    r = http.get(url, params=params, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(r.content)
+    os.replace(tmp, path)
+    return r.content
 
 
-# 2. Завантаження спектральних/епохальних вирізок SPHEREx через NASA IRSA SIA v2
-@app.get("/api/cutouts")
-def get_sky_cutouts(
-    ra: float = Query(..., description="Пряме сходження (градуси)"),
-    dec: float = Query(..., description="Схилення (градуси)"),
-    radius_deg: float = Query(0.05, description="Радіус вирізки у градусах"),
-    invert: bool = Query(True, description="Інверсія (FITS негатив)")
-):
-    cache_key = f"spherex_cutouts_{ra:.4f}_{dec:.4f}_{radius_deg:.3f}_{int(invert)}.json"
-    cache_path = CACHE_DIR / cache_key
+def mjd_to_iso(mjd):
+    return (datetime(1858, 11, 17) + timedelta(days=float(mjd))).strftime("%Y-%m-%d %H:%M")
 
-    if cache_path.exists():
-        return JSONResponse(content=json.loads(cache_path.read_text(encoding="utf-8")))
 
-    coord = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
-    epochs_data = []
-
-    # Спроба отримати з IRSA SIA SPHEREx
+def f_or_none(x):
     try:
-        params = {
-            "COLLECTION": "spherex",
-            "POS": f"CIRCLE {ra} {dec} {radius_deg}",
-            "FORMAT": "image/fits"
-        }
-        resp = requests.get(IRSA_SIA_URL, params=params, timeout=15)
-        if resp.status_code == 200:
-            votable = Table.read(io.BytesIO(resp.content), format="votable")
-            if len(votable) > 0:
-                if "t_min" in votable.colnames:
-                    votable.sort("t_min")
-                indices = np.linspace(0, len(votable) - 1, min(4, len(votable)), dtype=int)
-                for idx_num, row_idx in enumerate(indices, start=1):
-                    row = votable[row_idx]
-                    fits_url = str(row["access_url"])
-                    obs_date = str(row["t_min"]) if "t_min" in row.colnames else f"Frame #{idx_num}"
-                    with fits.open(fits_url, cache=False) as hdul:
-                        img_hdu = hdul[1] if (len(hdul) > 1 and hdul[1].data is not None) else hdul[0]
-                        wcs = WCS(img_hdu.header)
-                        size = u.Quantity((radius_deg * 2, radius_deg * 2), u.deg)
-                        cutout = Cutout2D(img_hdu.data, position=coord, size=size, wcs=wcs, mode="partial")
-                        b64_img = array_to_base64_png(cutout.data, invert=invert)
-                        epochs_data.append({"epoch": idx_num, "survey": "SPHEREx IR", "date": obs_date, "image": b64_img})
-    except Exception:
-        pass
+        v = float(x)
+        return v if math.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
 
-    # КАДРИ-ЗАМІНИ (Fallback): якщо IRSA нічого не повернув, використовуємо DSS SkyView для демонстрації блінк-компаратора
-    if not epochs_data:
-        fallback_surveys = [
-            {"survey": "DSS1 Blue", "date": "1950-1990 (E1)"},
-            {"survey": "DSS1 Red",  "date": "1950-1990 (E2)"},
-            {"survey": "DSS2 Blue", "date": "1990-2000 (E3)"},
-            {"survey": "DSS2 Red",  "date": "1990-2000 (E4)"},
-        ]
-        for idx, item in enumerate(fallback_surveys, start=1):
-            try:
-                images = SkyView.get_images(position=coord, survey=[item["survey"]], radius=radius_deg * u.deg, pixels=300)
-                if images and len(images) > 0:
-                    img_array = images[0][0].data
-                    b64_img = array_to_base64_png(img_array, invert=invert)
-                    epochs_data.append({"epoch": idx, "survey": f"SPHEREx-Sim ({item['survey']})", "date": item["date"], "image": b64_img})
-            except Exception:
-                pass
 
-    response_payload = {"ra": ra, "dec": dec, "epochs": epochs_data}
-    if epochs_data:
-        cache_path.write_text(json.dumps(response_payload), encoding="utf-8")
-    return response_payload
-
-# 3. Отримання реальних зірок з Gaia DR3 для накладання на карту
-@app.get("/api/gaia")
-def get_gaia_sources(
-    ra: float = Query(...),
-    dec: float = Query(...),
-    radius_deg: float = Query(0.05)
-):
-    query = f"""
-    SELECT TOP 150 source_id, ra, dec, phot_g_mean_mag, pmra, pmdec, parallax
-    FROM gaiadr3.gaia_source
-    WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra}, {dec}, {radius_deg})) = 1
+# --------------------------------------------------------------------------
+# SPHEREx: пошук знімків, що покривають точку
+# --------------------------------------------------------------------------
+def find_spherex_images(ra, dec, band=None):
     """
-    try:
-        job = Gaia.launch_job(query)
-        res = job.get_data()
-        stars = []
-        for row in res:
-            stars.append({
-                "source_id": str(row["source_id"]),
-                "ra": float(row["ra"]),
-                "dec": float(row["dec"]),
-                "mag": float(row["phot_g_mean_mag"]) if row["phot_g_mean_mag"] else 20.0,
-                "pmra": float(row["pmra"]) if row["pmra"] else 0.0,
-                "pmdec": float(row["pmdec"]) if row["pmdec"] else 0.0,
-            })
-        return {"count": len(stars), "stars": stars}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Помилка Gaia TAP: {str(e)}")
-
-
-# 4. Отримання спектрофотометричного профілю (SED) з NASA IRSA (SPHEREx TAP)
-@app.get("/api/sed")
-def get_irsa_sed(ra: float = Query(...), dec: float = Query(...)):
-    # Пошук найближчого спектрального джерела SPHEREx у радіусі 5 кутових секунд (0.0014 deg)
-    radius_deg = 5.0 / 3600.0
-
-    try:
-        # Спочатку визначаємо точну назву таблиці каталогу SPHEREx у IRSA TAP
-        tables_q = "SELECT table_name FROM TAP_SCHEMA.tables WHERE table_name LIKE '%spherex%'"
-        tables_res = Irsa.query_tap(tables_q).to_table()
-
-        if len(tables_res) == 0:
-            raise HTTPException(status_code=502, detail="Таблиці SPHEREx не знайдено в IRSA TAP")
-
-        # Обираємо основну фотометричну/спектральну таблицю джерел (зазвичай містить 'source' або 'spec' або 'psc')
-        available_tables = [str(t) for t in tables_res["table_name"]]
-        target_table = next(
-            (t for t in available_tables if any(k in t.lower() for k in ("spec", "source", "phot", "cat"))),
-            available_tables[0]
-        )
-
-        # Запит спектральних вимірювань навколо заданих координат
-        adql = f"""
-        SELECT TOP 200 *
-        FROM {target_table}
-        WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra}, {dec}, {radius_deg})) = 1
-        """
-        spec_table = Irsa.query_tap(adql).to_table()
-
-        if spec_table is None or len(spec_table) == 0:
-            return {"found": False, "table": target_table, "bands": []}
-
-        # Визначаємо колонки довжини хвилі та потоку в схемі SPHEREx
-        cols = {c.lower(): c for c in spec_table.colnames}
-        wl_col = next((cols[k] for k in ("wavelength", "wave", "lambda", "wl") if k in cols), None)
-        flux_col = next((cols[k] for k in ("flux", "fnu", "flux_mjy", "psf_flux") if k in cols), None)
-        id_col = next((cols[k] for k in ("source_id", "designation", "objid", "id") if k in cols), None)
-
-        if not wl_col or not flux_col:
-            return {
-                "found": True,
-                "table": target_table,
-                "raw_columns": spec_table.colnames,
-                "bands": []
+    Усі спектральні зображення SPHEREx, що покривають (ra, dec), за часом.
+    Дублі (та сама експозиція в різних версіях обробки/релізах) відсіюються —
+    лишається найновіша версія.
+    """
+    band_clause = f"AND p.energy_bandpassname = '{band}'" if band else ""
+    adql = f"""
+        SELECT a.uri AS uri,
+               p.time_bounds_lower AS mjd,
+               p.energy_bandpassname AS band,
+               p.provenance_version AS version
+        FROM spherex.artifact a
+        JOIN spherex.plane p ON a.planeid = p.planeid
+        WHERE 1 = CONTAINS(POINT('ICRS', {ra}, {dec}), p.poly)
+        {band_clause}
+        ORDER BY p.time_bounds_lower
+    """
+    rows = tap_query(IRSA_TAP, adql)
+    best = {}
+    for r in rows:
+        mjd = f_or_none(r.get("mjd"))
+        if mjd is None or not r.get("uri"):
+            continue
+        key = (round(mjd, 4), r["band"])
+        if key not in best or (r.get("version") or "") > (best[key].get("version") or ""):
+            best[key] = {
+                "url": IRSA_BASE + r["uri"].lstrip("/"),
+                "mjd": mjd,
+                "band": r["band"],
+                "version": r.get("version"),
             }
+    return sorted(best.values(), key=lambda x: x["mjd"])
 
-        # Сортуємо за зростанням довжини хвилі (0.75 -> 5.0 мкм)
-        spec_table.sort(wl_col)
-        designation = str(spec_table[0][id_col]) if id_col else f"SPHEREx J{ra:.4f}{dec:+.4f}"
 
-        bands = []
-        for row in spec_table:
-            wl = float(row[wl_col])
-            flux = float(row[flux_col])
-            if np.isfinite(wl) and np.isfinite(flux) and flux > 0:
-                # Конвертація потоку у зоряну величину AB (якщо потік у мЯн: m_AB = 16.4 - 2.5 * log10(F_mJy))
-                mag_ab = 16.4 - 2.5 * np.log10(flux)
-                bands.append({
-                    "wavelength_um": round(wl, 4),
-                    "mag": round(float(mag_ab), 3),
-                    "flux_mjy": round(flux, 4)
-                })
+def fetch_cutout(url, ra, dec, size_deg):
+    data = cached_get(url, {"center": f"{ra:.7f},{dec:.7f}", "size": f"{size_deg:.5f}"})
+    return fits.open(io.BytesIO(data), memmap=False)
 
-        return {
-            "found": True,
-            "table": target_table,
-            "designation": designation,
-            "bands": bands
-        }
-    except HTTPException:
-        raise
+
+# --------------------------------------------------------------------------
+# Перепроєкція вирізки на північ-вгору сітку (щоб епохи співпадали з Gaia)
+# --------------------------------------------------------------------------
+def to_north_up(data, wcs, ra0, dec0, size_deg, n=IMG_SIZE):
+    """
+    Ресемплінг у тангенціальну проєкцію: північ вгору, схід (RA↑) ліворуч —
+    рівно так, як фронтенд малює Gaia-оверлей і рахує координати кліку.
+    """
+    idx = (np.arange(n) + 0.5) / n
+    xi = (0.5 - idx)[None, :] * np.ones((n, 1)) * math.radians(size_deg)   # на схід
+    eta = (0.5 - idx)[:, None] * np.ones((1, n)) * math.radians(size_deg)  # на північ
+    d0, a0 = math.radians(dec0), math.radians(ra0)
+    rho = np.hypot(xi, eta)
+    c = np.arctan(rho)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sinc, cosc = np.sin(c), np.cos(c)
+        dec = np.arcsin(np.where(rho == 0, np.sin(d0),
+                                 cosc * np.sin(d0) + eta * sinc * np.cos(d0) / rho))
+        ra = a0 + np.arctan2(xi * sinc, rho * np.cos(d0) * cosc - eta * np.sin(d0) * sinc)
+    ra_deg, dec_deg = np.degrees(ra) % 360.0, np.degrees(dec)
+
+    x, y = wcs.all_world2pix(ra_deg, dec_deg, 0)
+    h, w = data.shape
+    valid = (x >= 0) & (x <= w - 1) & (y >= 0) & (y <= h - 1) & np.isfinite(x) & np.isfinite(y)
+
+    clean = np.where(np.isfinite(data), data, np.nanmedian(data))
+    out = map_coordinates(clean, [np.clip(y, 0, h - 1), np.clip(x, 0, w - 1)],
+                          order=1, mode="nearest")
+    out[~valid] = np.nan
+    return out, float(valid.mean())
+
+
+def render_png(img, invert):
+    """asinh-стретч навколо фону → PNG data URL."""
+    ok = np.isfinite(img)
+    if ok.sum() < 10:
+        return None
+    vals = img[ok]
+    med = np.median(vals)
+    sig = 1.4826 * np.median(np.abs(vals - med)) or (np.std(vals) or 1.0)
+    z = np.arcsinh((img - med) / sig)
+    z = np.clip((z + 1.0) / (np.arcsinh(12.0) + 1.0), 0, 1)
+    z[~ok] = 0
+    arr = (z * 255).astype(np.uint8)
+    if invert:
+        arr = 255 - arr
+        arr[~ok] = 255
+    buf = io.BytesIO()
+    Image.fromarray(arr, "L").save(buf, format="PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def pick_evenly(items, k):
+    if len(items) <= k:
+        return items
+    pos = np.linspace(0, len(items) - 1, k).round().astype(int)
+    return [items[i] for i in sorted(set(pos))]
+
+
+# --------------------------------------------------------------------------
+# /api/cutouts — кадри для блінк-компаратора
+# --------------------------------------------------------------------------
+@app.get("/api/cutouts")
+def api_cutouts():
+    try:
+        ra = float(request.args["ra"])
+        dec = float(request.args["dec"])
+        fov = float(request.args.get("radius_deg", 0.06))
+        invert = request.args.get("invert", "true").lower() == "true"
+        band = request.args.get("band")  # напр. SPHEREx-D2
+        max_epochs = int(request.args.get("max_epochs", DEFAULT_MAX_EPOCHS))
+    except (KeyError, ValueError) as e:
+        return jsonify(error=f"bad parameters: {e}"), 400
+
+    size = max(0.01, min(2 * fov, 0.5))  # cutout-сервіс: 0.01–0.5°
+    try:
+        images = find_spherex_images(ra, dec, band)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Помилка NASA IRSA SPHEREx TAP: {str(e)}")
+        log.exception("TAP failed")
+        return jsonify(error=f"IRSA TAP error: {e}"), 502
+
+    if not images:
+        return jsonify(epochs=[], note="SPHEREx не покриває цю точку (або дані ще не завантажені)")
+
+    # Для блінку беремо ОДИН детектор/смугу — із найбільшою кількістю повторних візитів,
+    # інакше різні довжини хвилі дають хибні "зміни яскравості".
+    if not band:
+        counts = {}
+        for im in images:
+            counts[im["band"]] = counts.get(im["band"], 0) + 1
+        band = max(counts, key=counts.get)
+        images = [im for im in images if im["band"] == band]
+
+    candidates = pick_evenly(images, max_epochs + 4)  # запас на невдалі/крайові кадри
+
+    def work(im):
+        try:
+            with fetch_cutout(im["url"], ra, dec, size) as hdul:
+                hdu = hdul["IMAGE"]
+                data = np.array(hdu.data, dtype=float)
+                wcs = WCS(hdu.header)
+            img, cover = to_north_up(data, wcs, ra, dec, size)
+            if cover < 0.5:
+                return None
+            png = render_png(img, invert)
+            return {"image": png, "mjd": im["mjd"], "survey": im["band"]} if png else None
+        except Exception as e:
+            log.warning("cutout failed %s: %s", im["url"], e)
+            return None
+
+    with ThreadPoolExecutor(WORKERS) as ex:
+        results = [r for r in ex.map(work, candidates) if r]
+
+    results = pick_evenly(results, max_epochs)
+    epochs = [
+        {"epoch": i + 1, "image": r["image"], "survey": r["survey"],
+         "date": f"{mjd_to_iso(r['mjd'])} (MJD {r['mjd']:.3f})"}
+        for i, r in enumerate(results)
+    ]
+    return jsonify(epochs=epochs, band=band, total_visits=len(images))
 
 
-# 5. Журнал відкриттів (Збереження та читання знахідок)
-@app.get("/api/discoveries")
-def list_discoveries():
-    if not DISCOVERIES_FILE.exists():
+# --------------------------------------------------------------------------
+# /api/gaia — Gaia DR3 у конусі
+# --------------------------------------------------------------------------
+@app.get("/api/gaia")
+def api_gaia():
+    try:
+        ra = float(request.args["ra"])
+        dec = float(request.args["dec"])
+        r = float(request.args.get("radius_deg", 0.06)) * 1.5  # з запасом на кути кадру
+    except (KeyError, ValueError) as e:
+        return jsonify(error=str(e)), 400
+
+    stars = []
+    try:
+        adql = f"""
+            SELECT TOP 800 source_id, ra, dec, pmra, pmdec, phot_g_mean_mag
+            FROM gaiadr3.gaia_source
+            WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra}, {dec}, {r}))
+            ORDER BY phot_g_mean_mag ASC
+        """
+        for row in tap_query(GAIA_TAP, adql, timeout=60):
+            stars.append({
+                "source_id": row["source_id"],
+                "ra": float(row["ra"]), "dec": float(row["dec"]),
+                "pmra": f_or_none(row["pmra"]) or 0.0,
+                "pmdec": f_or_none(row["pmdec"]) or 0.0,
+                "mag": f_or_none(row["phot_g_mean_mag"]) or 99.0,
+            })
+    except Exception as e:
+        log.warning("ESA Gaia failed (%s), trying VizieR", e)
+        try:
+            adql = f"""
+                SELECT TOP 800 Source, RA_ICRS, DE_ICRS, pmRA, pmDE, Gmag
+                FROM "I/355/gaiadr3"
+                WHERE 1 = CONTAINS(POINT('ICRS', RA_ICRS, DE_ICRS), CIRCLE('ICRS', {ra}, {dec}, {r}))
+                ORDER BY Gmag ASC
+            """
+            for row in tap_query(VIZIER_TAP, adql, timeout=60):
+                stars.append({
+                    "source_id": row["Source"],
+                    "ra": float(row["RA_ICRS"]), "dec": float(row["DE_ICRS"]),
+                    "pmra": f_or_none(row["pmRA"]) or 0.0,
+                    "pmdec": f_or_none(row["pmDE"]) or 0.0,
+                    "mag": f_or_none(row["Gmag"]) or 99.0,
+                })
+        except Exception as e2:
+            return jsonify(error=f"Gaia unavailable: {e2}", stars=[]), 502
+    return jsonify(stars=stars)
+
+
+# --------------------------------------------------------------------------
+# /api/sed — спектр SPHEREx у точці (спектрофотометрія по кожному знімку)
+# --------------------------------------------------------------------------
+def wavelength_um(hdul, header, x, y):
+    """Довжина хвилі в µm у піксельній позиції (лінійно-змінний фільтр, WCS key 'W')."""
+    swcs = WCS(header, fobj=hdul, key="W")
+    swcs.sip = None
+    res = swcs.pixel_to_world(x, y)
+    if isinstance(res, (tuple, list)):
+        res = res[0]
+    try:
+        return float(res.to(u.um).value)
+    except Exception:
+        return float(getattr(res, "value", res))
+
+
+def photometry_point(url, ra, dec):
+    """Потік (mJy) у точці: сума 3×3 мінус фон, × тілесний кут пікселя."""
+    with fetch_cutout(url, ra, dec, SED_CUTOUT_DEG) as hdul:
+        hdu = hdul["IMAGE"]
+        data = np.array(hdu.data, dtype=float)  # MJy/sr
+        wcs = WCS(hdu.header)
+        x, y = wcs.all_world2pix(ra, dec, 0)
+        h, w = data.shape
+        if not (0 <= x < w and 0 <= y < h):
+            return None
+        xi, yi = int(round(float(x))), int(round(float(y)))
+        y0, y1, x0, x1 = max(yi - 1, 0), min(yi + 2, h), max(xi - 1, 0), min(xi + 2, w)
+        patch = data[y0:y1, x0:x1]
+        if not np.isfinite(patch).any():
+            return None
+        bkg = np.nanmedian(data)
+        scales = proj_plane_pixel_scales(wcs)  # deg/pix
+        omega = (scales[0] * scales[1]) * (math.pi / 180.0) ** 2  # sr/pix
+        flux_mjy = float(np.nansum(patch - bkg)) * omega * 1e9  # MJy → mJy
+        return wavelength_um(hdul, hdu.header, x, y), flux_mjy
+
+
+@app.get("/api/sed")
+def api_sed():
+    try:
+        ra = float(request.args["ra"])
+        dec = float(request.args["dec"])
+        max_n = int(request.args.get("max", SED_DEFAULT_MAX))
+    except (KeyError, ValueError) as e:
+        return jsonify(found=False, error=str(e)), 400
+
+    try:
+        images = find_spherex_images(ra, dec)
+    except Exception as e:
+        log.exception("TAP failed")
+        return jsonify(found=False, error=str(e)), 502
+    if not images:
+        return jsonify(found=False, bands=[])
+
+    chosen = pick_evenly(images, max_n)
+
+    def work(im):
+        try:
+            return photometry_point(im["url"], ra, dec)
+        except Exception as e:
+            log.warning("sed point failed: %s", e)
+            return None
+
+    with ThreadPoolExecutor(WORKERS) as ex:
+        pts = [p for p in ex.map(work, chosen) if p and math.isfinite(p[0])]
+
+    pts.sort(key=lambda p: p[0])
+    return jsonify(
+        found=bool(pts),
+        designation=f"SPHEREx @ {ra:.5f}, {dec:+.5f}",
+        n_images_covering=len(images),
+        bands=[{"wavelength_um": round(w, 4), "flux_mjy": f} for w, f in pts],
+    )
+
+
+# --------------------------------------------------------------------------
+# /api/discoveries — простий JSON-журнал
+# --------------------------------------------------------------------------
+_lock = threading.Lock()
+
+
+def _read_discoveries():
+    if not os.path.exists(DISCOVERIES_FILE):
         return []
-    return json.loads(DISCOVERIES_FILE.read_text(encoding="utf-8"))
+    with open(DISCOVERIES_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+@app.get("/api/discoveries")
+def get_discoveries():
+    with _lock:
+        return jsonify(list(reversed(_read_discoveries())))
 
 
 @app.post("/api/discoveries")
-def add_discovery(item: DiscoveryItem):
-    items = []
-    if DISCOVERIES_FILE.exists():
-        items = json.loads(DISCOVERIES_FILE.read_text(encoding="utf-8"))
-    items.insert(0, item.model_dump())
-    DISCOVERIES_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"status": "saved", "total": len(items)}
+def post_discovery():
+    item = request.get_json(silent=True) or {}
+    required = ("observer", "type", "coords")
+    if not all(item.get(k) for k in required):
+        return jsonify(error=f"required: {required}"), 400
+    keep = ("id", "observer", "type", "coords", "displacement", "distance", "date")
+    clean = {k: str(item.get(k, ""))[:200] for k in keep}
+    with _lock:
+        data = _read_discoveries()
+        data.append(clean)
+        with open(DISCOVERIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    return jsonify(ok=True), 201
+
+
+# --------------------------------------------------------------------------
+# Фронтенд
+# --------------------------------------------------------------------------
+@app.get("/")
+def index():
+    return send_from_directory(BASE_DIR, "index.html")
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), threaded=True)
