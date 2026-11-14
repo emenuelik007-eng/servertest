@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SPHEREx Blink & Moving Object Hunter</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {
+      background-color: #090d16;
+      color: #e2e8f0;
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    }
+    .viewport-box {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      max-width: 540px;
+      background: #02040a;
+      border: 1px solid #1e293b;
+      border-radius: 0.75rem;
+      overflow: hidden;
+      cursor: crosshair;
+    }
+    .viewport-box img, .viewport-box canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      image-rendering: pixelated;
+    }
+    .diff-layer {
+      mix-blend-mode: difference;
+      opacity: 0.95;
+    }
+    /* Перехрестя в центрі */
+    .crosshair-h, .crosshair-v {
+      position: absolute;
+      background: rgba(56, 189, 248, 0.35);
+      pointer-events: none;
+    }
+    .crosshair-h { top: 50%; left: 0; right: 0; height: 1px; }
+    .crosshair-v { left: 50%; top: 0; bottom: 0; width: 1px; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+
+  <!-- Верхня панель навігації -->
+  <header class="border-b border-slate-800 bg-slate-950/80 backdrop-blur px-6 py-3 flex flex-wrap items-center justify-between gap-4">
+    <div class="flex items-center gap-3">
+      <div class="w-3 h-3 rounded-full bg-cyan-400 animate-pulse"></div>
+      <div>
+        <h1 class="text-lg font-bold tracking-wide text-white">SPHEREx <span class="text-cyan-400">Sky Blinker</span></h1>
+        <p class="text-xs text-slate-400">Пошук коричневих карликів, змінних зірок та рухомих об'єктів (0.75–5.0 µm)</p>
+      </div>
+    </div>
+
+    <!-- Швидкі тестові цілі з умов завдання -->
+    <div class="flex flex-wrap items-center gap-1.5 text-xs">
+      <span class="text-slate-400 mr-1">Тестові об'єкти:</span>
+      <button onclick="loadPreset(269.4521, 4.6934, 0.05, 'Barnard\'s Star')" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-cyan-900/60 border border-slate-700 text-cyan-200 transition">Barnard’s Star</button>
+      <button onclick="loadPreset(331.0760, -56.7825, 0.05, 'Epsilon Indi B')" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-cyan-900/60 border border-slate-700 text-cyan-200 transition">Epsilon Indi B</button>
+      <button onclick="loadPreset(133.7951, -7.2451, 0.06, 'WISE 0855 (Brown Dwarf)')" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-amber-900/50 border border-amber-700/60 text-amber-200 transition">WISE 0855</button>
+      <button onclick="loadPreset(76.9565, 30.4014, 0.04, 'RW Aurigae (Variable)')" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-purple-900/50 border border-purple-700/60 text-purple-200 transition">RW Aurigae</button>
+      <button onclick="loadPreset(248.1333, 66.7511, 0.04, 'R Draconis (Variable)')" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-purple-900/50 border border-purple-700/60 text-purple-200 transition">R Draconis</button>
+    </div>
+  </header>
+
+  <!-- Основна сітка -->
+  <main class="flex-1 max-w-7xl w-full mx-auto p-4 lg:p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+    <!-- Ліва колонка: Параметри пошуку та керування блінк-компаратором -->
+    <section class="lg:col-span-3 space-y-5">
+      <!-- Координати та FOV -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-4 space-y-3">
+        <h2 class="text-sm font-semibold text-slate-200 uppercase tracking-wider">1. Координати ділянки</h2>
+        
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Пряме сходження (RA, град. або год.)</label>
+          <input id="raInput" type="text" value="133.7951" placeholder="133.7951 або 08h55m10.8s"
+                 class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none focus:border-cyan-500" />
+        </div>
+
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Схилення (Dec, градуси)</label>
+          <input id="decInput" type="text" value="-7.2451" placeholder="-7.2451 або -7d14m42.5s"
+                 class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-white focus:outline-none focus:border-cyan-500" />
+        </div>
+
+        <div>
+          <div class="flex justify-between text-xs text-slate-400 mb-1">
+            <span>Поле зору (FOV радіус)</span>
+            <span id="fovLabel" class="text-cyan-400 font-mono">0.06°</span>
+          </div>
+          <input id="fovInput" type="range" min="0.02" max="0.25" step="0.01" value="0.06"
+                 oninput="document.getElementById('fovLabel').textContent = parseFloat(this.value).toFixed(2) + '°'"
+                 class="w-full accent-cyan-400" />
+        </div>
+
+        <div class="flex items-center justify-between pt-1">
+          <label class="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+            <input id="invertCheck" type="checkbox" checked class="accent-cyan-400 rounded" />
+            <span>Інверсія FITS (негатив)</span>
+          </label>
+          <button onclick="copyShareUrl()" class="text-xs text-cyan-400 hover:underline" title="Скопіювати посилання з координатами">
+            🔗 URL
+          </button>
+        </div>
+
+        <button onclick="fetchSkyData()" id="loadBtn"
+                class="w-full py-2 px-4 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold text-sm transition shadow-lg shadow-cyan-500/20">
+          Завантажити SPHEREx
+        </button>
+      </div>
+
+      <!-- Налаштування накладання та аналізу -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-4 space-y-3">
+        <h2 class="text-sm font-semibold text-slate-200 uppercase tracking-wider">2. Шари та аналіз</h2>
+
+        <label class="flex items-center justify-between text-xs text-slate-300 cursor-pointer">
+          <span>Overlay: Gaia DR3 + власний рух</span>
+          <input id="gaiaToggle" type="checkbox" checked onchange="renderGaiaOverlay()" class="accent-cyan-400" />
+        </label>
+
+        <label class="flex items-center justify-between text-xs text-slate-300 cursor-pointer">
+          <span>Режим віднімання (Epoch N − E1)</span>
+          <input id="diffToggle" type="checkbox" onchange="updateFrameDisplay()" class="accent-amber-400" />
+        </label>
+
+        <label class="flex items-center justify-between text-xs text-slate-300 cursor-pointer">
+          <span>Центральне перехрестя</span>
+          <input id="crosshairToggle" type="checkbox" checked onchange="toggleCrosshair()" class="accent-cyan-400" />
+        </label>
+
+        <div class="pt-2 border-t border-slate-800 text-[11px] text-slate-400 space-y-1">
+          <p>• <b class="text-slate-200">Клік по карті:</b> побудувати ІЧ-спектр (SED) у точці.</p>
+          <p>• <b class="text-slate-200">Shift + Клік:</b> зафіксувати кандидата у журнал.</p>
+          <p>• <b class="text-slate-200">Пробіл / ← →:</b> керування анімацією.</p>
+        </div>
+      </div>
+
+      <!-- Фіксація відкриття -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-4 space-y-3">
+        <h2 class="text-sm font-semibold text-slate-200 uppercase tracking-wider">3. Новий кандидат</h2>
+        <select id="candidateType" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white">
+          <option value="Brown Dwarf Candidate">Коричневий карлик (Brown Dwarf)</option>
+          <option value="High Proper Motion Star">Зоря з великим власним рухом</option>
+          <option value="Solar System / Asteroid / Comet">Астероїд / Комета / Planet X</option>
+          <option value="Variable / Transient">Змінна зоря / Транзієнт</option>
+        </select>
+        <input id="observerName" type="text" placeholder="Ваш нікнейм спостерігача" value="Citizen_Astronomer"
+               class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white" />
+        <button onclick="submitDiscovery()"
+                class="w-full py-1.5 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs transition">
+          + Записати відкриття в базу
+        </button>
+      </div>
+    </section>
+
+    <!-- Центральна колонка: Відео-плеєр / Блінк-компаратор -->
+    <section class="lg:col-span-5 flex flex-col items-center space-y-4">
+      <div class="w-full max-w-[540px] flex items-center justify-between text-xs bg-slate-900 border border-slate-800 rounded-lg px-3 py-2">
+        <span id="targetTitle" class="font-semibold text-cyan-300">WISE 0855 (Brown Dwarf)</span>
+        <span id="epochBadge" class="font-mono text-slate-300 bg-slate-800 px-2 py-0.5 rounded">Очікування...</span>
+      </div>
+
+      <!-- Вікно перегляду неба -->
+      <div class="viewport-box shadow-2xl" id="skyViewport" onclick="handleViewportClick(event)">
+        <!-- Базовий кадр для режиму віднімання -->
+        <img id="baseEpochImg" src="" alt="" class="hidden" />
+        <!-- Поточний кадр епохи -->
+        <img id="currentEpochImg" src="" alt="SPHEREx Cutout" class="hidden" />
+        <!-- Шар зірок Gaia DR3 -->
+        <canvas id="gaiaCanvas" width="540" height="540"></canvas>
+
+        <!-- Перехрестя -->
+        <div id="crosshairH" class="crosshair-h"></div>
+        <div id="crosshairV" class="crosshair-v"></div>
+
+        <!-- Індикатор завантаження -->
+        <div id="loaderOverlay" class="hidden absolute inset-0 bg-slate-950/80 flex flex-col items-center justify-center gap-2 z-20">
+          <div class="w-8 h-8 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin"></div>
+          <span class="text-xs text-cyan-300">Завантаження FITS з NASA IRSA SPHEREx...</span>
+        </div>
+
+        <!-- Підказка при наведенні на зорю Gaia -->
+        <div id="starTooltip" class="hidden absolute z-30 bg-slate-950/95 border border-cyan-500/50 rounded px-2 py-1 text-[11px] text-slate-200 pointer-events-none shadow-lg"></div>
+      </div>
+
+      <!-- Панель плеєра (Відео епох) -->
+      <div class="w-full max-w-[540px] bg-slate-900 border border-slate-800 rounded-xl p-3 space-y-3">
+        <div class="flex items-center justify-between gap-2">
+          <div class="flex items-center gap-1.5">
+            <button onclick="prevFrame()" class="px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-xs">◀</button>
+            <button onclick="togglePlay()" id="playPauseBtn" class="px-4 py-1.5 rounded bg-cyan-600 hover:bg-cyan-500 text-white font-semibold text-xs">
+              ⏸ Пауза
+            </button>
+            <button onclick="nextFrame()" class="px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-xs">▶</button>
+          </div>
+
+          <!-- Вибір швидкості (FPS) -->
+          <div class="flex items-center gap-2 text-xs">
+            <span class="text-slate-400">Швидкість:</span>
+            <select id="fpsSelect" onchange="restartBlinkTimer()" class="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs">
+              <option value="1000">1 FPS (Повільно)</option>
+              <option value="500" selected>2 FPS (Норма)</option>
+              <option value="250">4 FPS (Швидко)</option>
+              <option value="125">8 FPS (Турбо)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Шкала кадрів (епох) -->
+        <div id="frameButtons" class="grid grid-cols-4 gap-2"></div>
+        <div id="epochMeta" class="text-[11px] font-mono text-slate-400 text-center">
+          Час спостереження та спектральний канал з'являться після завантаження
+        </div>
+      </div>
+    </section>
+
+    <!-- Права колонка: Спектр SPHEREx (SED) та журнал відкриттів -->
+    <section class="lg:col-span-4 space-y-5">
+      <!-- Графік інфрачервоного спектру -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-4 space-y-2">
+        <div class="flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-slate-200 uppercase tracking-wider">Спектр SPHEREx (SED)</h2>
+          <button onclick="fetchSedAtCenter()" class="text-xs text-cyan-400 hover:underline">Оновити центр</button>
+        </div>
+        <p id="sedSubtitle" class="text-xs text-slate-400">
+          Клікніть по об'єкту на знімку, щоб перевірити молекулярні смуги (H₂O, CH₄, CO)
+        </p>
+        <div class="h-52 w-full pt-2">
+          <canvas id="sedChart"></canvas>
+        </div>
+        <div class="flex justify-between text-[10px] text-slate-500 pt-1">
+          <span>0.75 µm (Ближній ІЧ)</span>
+          <span>1.4/1.9 µm (H₂O)</span>
+          <span>3.3 µm (CH₄)</span>
+          <span>5.0 µm (CO)</span>
+        </div>
+      </div>
+
+      <!-- Журнал знахідок -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-4 flex flex-col max-h-[340px]">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-sm font-semibold text-slate-200 uppercase tracking-wider">Журнал відкриттів</h2>
+          <span id="discoveriesCount" class="text-xs bg-slate-800 text-cyan-400 px-2 py-0.5 rounded-full">0</span>
+        </div>
+        <div id="discoveriesList" class="space-y-2 overflow-y-auto pr-1 text-xs flex-1">
+          <p class="text-slate-500 text-center py-6">Поки немає зафіксованих об'єктів</p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    // Глобальний стан додатку
+    let epochs = [];
+    let currentFrameIndex = 0;
+    let isPlaying = true;
+    let blinkInterval = null;
+    let gaiaStars = [];
+    let currentRa = 133.7951;
+    let currentDec = -7.2451;
+    let currentFov = 0.06;
+    let selectedClickCoords = null;
+    let sedChartInstance = null;
+
+    // Парсинг координат (підтримує десяткові градуси та формат HMS/DMS)
+    function parseCoordinate(val, isRa = false) {
+      val = val.trim();
+      if (!isNaN(Number(val))) return parseFloat(val);
+      const match = val.match(/([+-]?\d+)[hHdD:\s]+(\d+)[mM:\s]+([\d.]+)[sS]?/);
+      if (match) {
+        const sign = match[1].startsWith('-') ? -1 : 1;
+        const degOrHr = Math.abs(parseFloat(match[1]));
+        const min = parseFloat(match[2]);
+        const sec = parseFloat(match[3]);
+        let decimal = sign * (degOrHr + min / 60 + sec / 3600);
+        if (isRa && /[hH]/.test(val)) decimal *= 15.0;
+        return decimal;
+      }
+      return parseFloat(val);
+    }
+
+    // Ініціалізація при завантаженні сторінки (перевірка URL параметрів)
+    window.addEventListener('DOMContentLoaded', () => {
+      initSedChart();
+      loadDiscoveries();
+
+      const params = new URLSearchParams(window.location.search);
+      if (params.has('ra') && params.has('dec')) {
+        document.getElementById('raInput').value = params.get('ra');
+        document.getElementById('decInput').value = params.get('dec');
+        if (params.has('fov')) {
+          document.getElementById('fovInput').value = params.get('fov');
+          document.getElementById('fovLabel').textContent = parseFloat(params.get('fov')).toFixed(2) + '°';
+        }
+        document.getElementById('targetTitle').textContent = `Custom Sky (${params.get('ra')}, ${params.get('dec')})`;
+      }
+      fetchSkyData();
+    });
+
+    // Вибір пресету із завдання
+    function loadPreset(ra, dec, fov, label) {
+      document.getElementById('raInput').value = ra;
+      document.getElementById('decInput').value = dec;
+      document.getElementById('fovInput').value = fov;
+      document.getElementById('fovLabel').textContent = fov.toFixed(2) + '°';
+      document.getElementById('targetTitle').textContent = label;
+      fetchSkyData();
+    }
+
+    // Синхронізація координат в URL (для шерінгу та embed)
+    function updateUrlParams(ra, dec, fov) {
+      const url = new URL(window.location);
+      url.searchParams.set('ra', ra.toFixed(5));
+      url.searchParams.set('dec', dec.toFixed(5));
+      url.searchParams.set('fov', fov.toFixed(2));
+      window.history.replaceState({}, '', url);
+    }
+
+    function copyShareUrl() {
+      navigator.clipboard.writeText(window.location.href);
+      alert('Посилання з координатами скопійовано в буфер обміну!');
+    }
+
+    // Основний запит до бекенду: знімки SPHEREx + каталог Gaia + SED
+    async function fetchSkyData() {
+      const ra = parseCoordinate(document.getElementById('raInput').value, true);
+      const dec = parseCoordinate(document.getElementById('decInput').value, false);
+      const fov = parseFloat(document.getElementById('fovInput').value);
+      const invert = document.getElementById('invertCheck').checked;
+
+      if (isNaN(ra) || isNaN(dec)) {
+        alert('Некоректний формат координат RA або Dec.');
+        return;
+      }
+
+      currentRa = ra;
+      currentDec = dec;
+      currentFov = fov;
+      selectedClickCoords = { ra, dec };
+      updateUrlParams(ra, dec, fov);
+
+      const loader = document.getElementById('loaderOverlay');
+      loader.classList.remove('hidden');
+
+      try {
+        // Паралельно запитуємо знімки SPHEREx, зірки Gaia DR3 та спектр центру
+        const [cutoutsRes, gaiaRes] = await Promise.all([
+          fetch(`/api/cutouts?ra=${ra}&dec=${dec}&radius_deg=${fov}&invert=${invert}`),
+          fetch(`/api/gaia?ra=${ra}&dec=${dec}&radius_deg=${fov}`)
+        ]);
+
+        if (!cutoutsRes.ok) throw new Error(await cutoutsRes.text());
+        const cutoutsData = await cutoutsRes.json();
+
+        epochs = (cutoutsData.epochs || []).filter(e => e.image);
+        currentFrameIndex = 0;
+        buildFrameButtons();
+        updateFrameDisplay();
+        restartBlinkTimer();
+
+        if (gaiaRes.ok) {
+          const gaiaData = await gaiaRes.json();
+          gaiaStars = gaiaData.stars || [];
+          renderGaiaOverlay();
+        }
+
+        fetchSed(ra, dec);
+      } catch (err) {
+        console.error(err);
+        document.getElementById('epochMeta').textContent = 'Помилка завантаження даних SPHEREx: ' + err.message;
+      } finally {
+        loader.classList.add('hidden');
+      }
+    }
+
+    // Керування анімацією блінк-компаратора
+    function buildFrameButtons() {
+      const container = document.getElementById('frameButtons');
+      container.innerHTML = '';
+      if (epochs.length === 0) {
+        container.innerHTML = '<div class="col-span-4 text-center text-xs text-amber-400">Немає доступних знімків SPHEREx для цієї області</div>';
+        return;
+      }
+      epochs.forEach((ep, idx) => {
+        const btn = document.createElement('button');
+        btn.id = `frameBtn_${idx}`;
+        btn.className = 'py-1.5 px-2 rounded text-xs font-mono border transition bg-slate-950 border-slate-700 text-slate-300';
+        btn.textContent = `E${ep.epoch}`;
+        btn.onclick = () => {
+          currentFrameIndex = idx;
+          updateFrameDisplay();
+        };
+        container.appendChild(btn);
+      });
+    }
+
+    function updateFrameDisplay() {
+      const curImg = document.getElementById('currentEpochImg');
+      const baseImg = document.getElementById('baseEpochImg');
+      const diffMode = document.getElementById('diffToggle').checked;
+
+      if (epochs.length === 0) {
+        curImg.classList.add('hidden');
+        baseImg.classList.add('hidden');
+        document.getElementById('epochBadge').textContent = '0 кадрів';
+        return;
+      }
+
+      const ep = epochs[currentFrameIndex];
+      curImg.src = ep.image;
+      curImg.classList.remove('hidden');
+
+      if (diffMode && epochs.length > 1) {
+        baseImg.src = epochs[0].image;
+        baseImg.classList.remove('hidden');
+        curImg.classList.add('diff-layer');
+      } else {
+        baseImg.classList.add('hidden');
+        curImg.classList.remove('diff-layer');
+      }
+
+      document.getElementById('epochBadge').textContent = `Кадр ${currentFrameIndex + 1}/${epochs.length} • ${ep.survey}`;
+      document.getElementById('epochMeta').textContent = `Епоха #${ep.epoch} | Дата/MJD: ${ep.date} | Канал: ${ep.survey}`;
+
+      epochs.forEach((_, idx) => {
+        const b = document.getElementById(`frameBtn_${idx}`);
+        if (!b) return;
+        if (idx === currentFrameIndex) {
+          b.className = 'py-1.5 px-2 rounded text-xs font-mono border bg-cyan-500/20 border-cyan-400 text-cyan-300 font-bold';
+        } else {
+          b.className = 'py-1.5 px-2 rounded text-xs font-mono border bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-600';
+        }
+      });
+    }
+
+    function nextFrame() {
+      if (epochs.length === 0) return;
+      currentFrameIndex = (currentFrameIndex + 1) % epochs.length;
+      updateFrameDisplay();
+    }
+
+    function prevFrame() {
+      if (epochs.length === 0) return;
+      currentFrameIndex = (currentFrameIndex - 1 + epochs.length) % epochs.length;
+      updateFrameDisplay();
+    }
+
+    function togglePlay() {
+      isPlaying = !isPlaying;
+      document.getElementById('playPauseBtn').textContent = isPlaying ? '⏸ Пауза' : '▶ Пуск';
+      restartBlinkTimer();
+    }
+
+    function restartBlinkTimer() {
+      if (blinkInterval) clearInterval(blinkInterval);
+      if (isPlaying && epochs.length > 1) {
+        const delay = parseInt(document.getElementById('fpsSelect').value, 10);
+        blinkInterval = setInterval(nextFrame, delay);
+      }
+    }
+
+    // Гарячі клавіші
+    window.addEventListener('keydown', (e) => {
+      if (['INPUT', 'SELECT'].includes(document.activeElement.tagName)) return;
+      if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+      if (e.code === 'ArrowRight') nextFrame();
+      if (e.code === 'ArrowLeft') prevFrame();
+    });
+
+    function toggleCrosshair() {
+      const show = document.getElementById('crosshairToggle').checked;
+      document.getElementById('crosshairH').style.display = show ? 'block' : 'none';
+      document.getElementById('crosshairV').style.display = show ? 'block' : 'none';
+    }
+
+    // Накладання зірок Gaia DR3 та векторів їх власного руху (Proper Motion)
+    function renderGaiaOverlay() {
+      const canvas = document.getElementById('gaiaCanvas');
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (!document.getElementById('gaiaToggle').checked || gaiaStars.length === 0) return;
+
+      const cosDec = Math.cos(currentDec * Math.PI / 180);
+
+      gaiaStars.forEach(star => {
+        // Перетворення (RA, Dec) у пікселі канвасу (у небі RA зростає вліво)
+        const dxDeg = (star.ra - currentRa) * cosDec;
+        const dyDeg = star.dec - currentDec;
+
+        const px = canvas.width / 2 - (dxDeg / (currentFov * 2)) * canvas.width;
+        const py = canvas.height / 2 - (dyDeg / (currentFov * 2)) * canvas.height;
+
+        if (px < 0 || px > canvas.width || py < 0 || py > canvas.height) return;
+
+        star._px = px;
+        star._py = py;
+
+        // Коло навколо відомої зорі Gaia
+        ctx.strokeStyle = 'rgba(52, 211, 153, 0.75)';
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.arc(px, py, 7, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Вектор власного руху (якщо зірка швидко рухається)
+        const pmTotal = Math.hypot(star.pmra, star.pmdec);
+        if (pmTotal > 20) {
+          const scale = 0.08;
+          ctx.strokeStyle = '#fbbf24';
+          ctx.beginPath();
+          ctx.moveTo(px, py);
+          ctx.lineTo(px - star.pmra * scale, py - star.pmdec * scale);
+          ctx.stroke();
+        }
+      });
+    }
+
+    // Інтерактивність на карті: клік для спектру або Shift+клік для відкриття
+    function handleViewportClick(event) {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const normX = (event.clientX - rect.left) / rect.width;
+      const normY = (event.clientY - rect.top) / rect.height;
+
+      const cosDec = Math.cos(currentDec * Math.PI / 180);
+      const clickRa = currentRa - ((normX - 0.5) * (currentFov * 2)) / cosDec;
+      const clickDec = currentDec - (normY - 0.5) * (currentFov * 2);
+
+      selectedClickCoords = { ra: clickRa, dec: clickDec };
+
+      if (event.shiftKey) {
+        submitDiscovery(clickRa, clickDec);
+      } else {
+        fetchSed(clickRa, clickDec);
+      }
+    }
+
+    // Підказка при наведенні курсора на маркер Gaia
+    document.getElementById('skyViewport').addEventListener('mousemove', (e) => {
+      const tooltip = document.getElementById('starTooltip');
+      if (!document.getElementById('gaiaToggle').checked) {
+        tooltip.classList.add('hidden');
+        return;
+      }
+      const rect = e.currentTarget.getBoundingClientRect();
+      const mx = ((e.clientX - rect.left) / rect.width) * 540;
+      const my = ((e.clientY - rect.top) / rect.height) * 540;
+
+      const hovered = gaiaStars.find(s => s._px && Math.hypot(s._px - mx, s._py - my) < 10);
+      if (hovered) {
+        tooltip.style.left = `${e.clientX - rect.left + 12}px`;
+        tooltip.style.top = `${e.clientY - rect.top + 12}px`;
+        tooltip.innerHTML = `
+          <div class="font-semibold text-emerald-400">Gaia DR3 ${hovered.source_id}</div>
+          <div>G mag: <b>${hovered.mag.toFixed(2)}</b></div>
+          <div>PM: (${hovered.pmra.toFixed(1)}, ${hovered.pmdec.toFixed(1)}) mas/yr</div>
+        `;
+        tooltip.classList.remove('hidden');
+      } else {
+        tooltip.classList.add('hidden');
+      }
+    });
+
+    // Побудова графіку SED (Спектрофотометрія SPHEREx)
+    function initSedChart() {
+      const ctx = document.getElementById('sedChart').getContext('2d');
+      sedChartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [{
+            label: 'Потік SPHEREx (mJy)',
+            data: [],
+            borderColor: '#22d3ee',
+            backgroundColor: 'rgba(34, 211, 238, 0.15)',
+            borderWidth: 2,
+            pointRadius: 3,
+            fill: true,
+            tension: 0.25
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: {
+              title: { display: true, text: 'Довжина хвилі (µm)', color: '#94a3b8', font: { size: 10 } },
+              ticks: { color: '#64748b', font: { size: 10 } },
+              grid: { color: '#1e293b' }
+            },
+            y: {
+              title: { display: true, text: 'Потік (mJy)', color: '#94a3b8', font: { size: 10 } },
+              ticks: { color: '#64748b', font: { size: 10 } },
+              grid: { color: '#1e293b' }
+            }
+          }
+        }
+      });
+    }
+
+    function fetchSedAtCenter() {
+      fetchSed(currentRa, currentDec);
+    }
+
+    async function fetchSed(ra, dec) {
+      const sub = document.getElementById('sedSubtitle');
+      sub.textContent = `Запит спектру для RA ${ra.toFixed(4)}°, Dec ${dec.toFixed(4)}°...`;
+
+      try {
+        const res = await fetch(`/api/sed?ra=${ra}&dec=${dec}`);
+        const data = await res.json();
+
+        if (!data.found || !data.bands || data.bands.length === 0) {
+          sub.textContent = `Спектральних даних у точці (${ra.toFixed(4)}, ${dec.toFixed(4)}) не знайдено.`;
+          sedChartInstance.data.labels = [];
+          sedChartInstance.data.datasets[0].data = [];
+          sedChartInstance.update();
+          return;
+        }
+
+        sub.textContent = `Джерело: ${data.designation || 'SPHEREx Source'} (${data.bands.length} каналів)`;
+        sedChartInstance.data.labels = data.bands.map(b => b.wavelength_um);
+        sedChartInstance.data.datasets[0].data = data.bands.map(b => b.flux_mjy);
+        sedChartInstance.update();
+      } catch (e) {
+        sub.textContent = 'Помилка побудови спектру SED.';
+      }
+    }
+
+    // Журнал відкриттів (POST / GET /api/discoveries)
+    async function loadDiscoveries() {
+      try {
+        const res = await fetch('/api/discoveries');
+        const list = await res.json();
+        document.getElementById('discoveriesCount').textContent = list.length;
+        const container = document.getElementById('discoveriesList');
+
+        if (list.length === 0) {
+          container.innerHTML = '<p class="text-slate-500 text-center py-6">Поки немає зафіксованих об\'єктів</p>';
+          return;
+        }
+
+        container.innerHTML = list.map(item => `
+          <div class="bg-slate-950 border border-slate-800 rounded-lg p-2.5 space-y-1">
+            <div class="flex justify-between items-center">
+              <span class="font-semibold text-emerald-400">${item.type}</span>
+              <span class="text-[10px] text-slate-500">${item.date}</span>
+            </div>
+            <div class="font-mono text-[11px] text-slate-300">${item.coords}</div>
+            <div class="text-[10px] text-slate-400">Спостерігач: ${item.observer} • Зміщення: ${item.displacement}</div>
+          </div>
+        `).join('');
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function submitDiscovery(customRa = null, customDec = null) {
+      const ra = customRa ?? (selectedClickCoords ? selectedClickCoords.ra : currentRa);
+      const dec = customDec ?? (selectedClickCoords ? selectedClickCoords.dec : currentDec);
+
+      const payload = {
+        id: 'SPX-' + Date.now().toString().slice(-6),
+        observer: document.getElementById('observerName').value || 'Anonymous',
+        type: document.getElementById('candidateType').value,
+        coords: `${ra.toFixed(5)}°, ${dec.toFixed(5)}°`,
+        displacement: document.getElementById('diffToggle').checked ? 'Виявлено диполь (Diff)' : 'Візуально (Blink)',
+        distance: `FOV ${currentFov.toFixed(2)}°`,
+        date: new Date().toISOString().split('T')[0]
+      };
+
+      const res = await fetch('/api/discoveries', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (res.ok) {
+        loadDiscoveries();
+      }
+    }
+  </script>
+</body>
+</html>
