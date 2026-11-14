@@ -139,6 +139,11 @@
         </label>
 
         <label class="flex items-center justify-between text-xs text-slate-300 cursor-pointer">
+          <span>Overlay: WISE (AllWISE, W1/W2)</span>
+          <input id="wiseToggle" type="checkbox" checked onchange="renderWiseOverlay()" class="accent-fuchsia-400" />
+        </label>
+
+        <label class="flex items-center justify-between text-xs text-slate-300 cursor-pointer">
           <span>Режим віднімання (Epoch N − E1)</span>
           <input id="diffToggle" type="checkbox" onchange="updateFrameDisplay()" class="accent-amber-400" />
         </label>
@@ -193,6 +198,8 @@
         <img id="currentEpochImg" src="" alt="SPHEREx Cutout" class="hidden" />
         <!-- Шар зірок Gaia DR3 -->
         <canvas id="gaiaCanvas" width="540" height="540"></canvas>
+        <!-- Шар джерел WISE -->
+        <canvas id="wiseCanvas" width="540" height="540"></canvas>
 
         <!-- Перехрестя -->
         <div id="crosshairH" class="crosshair-h"></div>
@@ -283,6 +290,7 @@
     let isPlaying = true;
     let blinkInterval = null;
     let gaiaStars = [];
+    let wiseSources = [];
     let currentRa = 133.7951;
     let currentDec = -7.2451;
     let currentFov = 0.06;
@@ -377,10 +385,11 @@
 
       try {
         // Паралельно запитуємо знімки SPHEREx, зірки Gaia DR3 та спектр центру
-        const [cutoutsRes, gaiaRes] = await Promise.all([
+        const [cutoutsRes, gaiaRes, wiseRes] = await Promise.all([
           fetch(`/api/cutouts?ra=${ra}&dec=${dec}&radius_deg=${fov}&invert=${invert}` +
                 (band ? `&band=${encodeURIComponent(band)}` : '')),
-          fetch(`/api/gaia?ra=${ra}&dec=${dec}&radius_deg=${fov}`)
+          fetch(`/api/gaia?ra=${ra}&dec=${dec}&radius_deg=${fov}`),
+          fetch(`/api/wise?ra=${ra}&dec=${dec}&radius_deg=${fov}`).catch(() => null)
         ]);
 
         if (!cutoutsRes.ok) throw new Error(await cutoutsRes.text());
@@ -406,6 +415,13 @@
           gaiaStars = gaiaData.stars || [];
           renderGaiaOverlay();
         }
+
+        wiseSources = [];
+        if (wiseRes && wiseRes.ok) {
+          const wiseData = await wiseRes.json();
+          wiseSources = wiseData.sources || [];
+        }
+        renderWiseOverlay();
 
         fetchSed(ra, dec);
       } catch (err) {
@@ -575,6 +591,46 @@
       });
     }
 
+    // Накладання джерел WISE (AllWISE): рожеві квадрати + вектор власного руху
+    function renderWiseOverlay() {
+      const canvas = document.getElementById('wiseCanvas');
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (!document.getElementById('wiseToggle').checked || wiseSources.length === 0) return;
+
+      const cosDec = Math.cos(currentDec * Math.PI / 180);
+
+      wiseSources.forEach(src => {
+        const dxDeg = (src.ra - currentRa) * cosDec;
+        const dyDeg = src.dec - currentDec;
+        const px = canvas.width / 2 - (dxDeg / (currentFov * 2)) * canvas.width;
+        const py = canvas.height / 2 - (dyDeg / (currentFov * 2)) * canvas.height;
+
+        src._px = px;
+        src._py = py;
+        if (px < 0 || px > canvas.width || py < 0 || py > canvas.height) return;
+
+        ctx.strokeStyle = 'rgba(232, 121, 249, 0.85)';
+        ctx.lineWidth = 1.2;
+        ctx.strokeRect(px - 8, py - 8, 16, 16);
+
+        // AllWISE PM для слабких джерел — здебільшого шум, тому малюємо вектор
+        // лише для значущого руху (S/N > 5) і обмежуємо його довжину.
+        const pmTotal = Math.hypot(src.pmra, src.pmdec);
+        const sigTotal = (src.sigpmra != null && src.sigpmdec != null)
+          ? Math.hypot(src.sigpmra, src.sigpmdec) : null;
+        if (sigTotal && pmTotal > 20 && pmTotal / sigTotal > 5) {
+          const len = Math.min(pmTotal * 0.08, 40);
+          const k = len / pmTotal;
+          ctx.beginPath();
+          ctx.moveTo(px, py);
+          ctx.lineTo(px - src.pmra * k, py - src.pmdec * k);
+          ctx.stroke();
+        }
+      });
+    }
+
     // Інтерактивність на карті: клік для спектру або Shift+клік для відкриття
     function handleViewportClick(event) {
       const rect = event.currentTarget.getBoundingClientRect();
@@ -597,7 +653,9 @@
     // Підказка при наведенні курсора на маркер Gaia
     document.getElementById('skyViewport').addEventListener('mousemove', (e) => {
       const tooltip = document.getElementById('starTooltip');
-      if (!document.getElementById('gaiaToggle').checked) {
+      const gaiaOn = document.getElementById('gaiaToggle').checked;
+      const wiseOn = document.getElementById('wiseToggle').checked;
+      if (!gaiaOn && !wiseOn) {
         tooltip.classList.add('hidden');
         return;
       }
@@ -605,8 +663,24 @@
       const mx = ((e.clientX - rect.left) / rect.width) * 540;
       const my = ((e.clientY - rect.top) / rect.height) * 540;
 
-      const hovered = gaiaStars.find(s => s._px && Math.hypot(s._px - mx, s._py - my) < 10);
-      if (hovered) {
+      const hoveredWise = wiseOn
+        ? wiseSources.find(s => s._px && Math.hypot(s._px - mx, s._py - my) < 10)
+        : null;
+      const hovered = gaiaOn
+        ? gaiaStars.find(s => s._px && Math.hypot(s._px - mx, s._py - my) < 10)
+        : null;
+
+      if (!hovered && hoveredWise) {
+        const fmt = v => (v == null ? '—' : v.toFixed(2));
+        tooltip.style.left = `${e.clientX - rect.left + 12}px`;
+        tooltip.style.top = `${e.clientY - rect.top + 12}px`;
+        tooltip.innerHTML = `
+          <div class="font-semibold text-fuchsia-400">AllWISE ${hoveredWise.designation}</div>
+          <div>W1: <b>${fmt(hoveredWise.w1)}</b> · W2: <b>${fmt(hoveredWise.w2)}</b></div>
+          <div>PM: (${hoveredWise.pmra.toFixed(0)}, ${hoveredWise.pmdec.toFixed(0)}) mas/yr</div>
+        `;
+        tooltip.classList.remove('hidden');
+      } else if (hovered) {
         tooltip.style.left = `${e.clientX - rect.left + 12}px`;
         tooltip.style.top = `${e.clientY - rect.top + 12}px`;
         tooltip.innerHTML = `

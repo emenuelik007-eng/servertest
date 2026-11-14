@@ -10,6 +10,7 @@ SPHEREx Sky Blinker — бекенд.
 Ендпоінти (під фронтенд index.html):
   GET  /api/cutouts?ra=&dec=&radius_deg=&invert=&band=&max_epochs=
   GET  /api/gaia?ra=&dec=&radius_deg=
+  GET  /api/wise?ra=&dec=&radius_deg=
   GET  /api/sed?ra=&dec=&max=
   GET  /api/discoveries
   POST /api/discoveries
@@ -334,6 +335,56 @@ def api_gaia():
         except Exception as e2:
             return jsonify(error=f"Gaia unavailable: {e2}", stars=[]), 502
     return jsonify(stars=stars)
+
+
+# --------------------------------------------------------------------------
+# /api/wise — джерела AllWISE у конусі (оверлей)
+# --------------------------------------------------------------------------
+@app.get("/api/wise")
+def api_wise():
+    try:
+        ra = float(request.args["ra"])
+        dec = float(request.args["dec"])
+        r = float(request.args.get("radius_deg", 0.06)) * 1.5
+    except (KeyError, ValueError) as e:
+        return jsonify(error=str(e), sources=[]), 400
+
+    # AllWISE Source Catalog в IRSA; власні рухи (pmra/pmdec) у mas/yr.
+    def build(cols):
+        return f"""
+            SELECT TOP 800 {cols}
+            FROM allwise_p3as_psd
+            WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra}, {dec}, {r}))
+            ORDER BY w2mpro ASC
+        """
+
+    base_cols = "designation, ra, dec, w1mpro, w2mpro, pmra, pmdec"
+    try:
+        # sigpmra/sigpmdec — похибки власного руху: без них вектори PM ненадійні
+        rows = tap_query(IRSA_TAP, build(base_cols + ", sigpmra, sigpmdec"), timeout=60)
+    except Exception:
+        try:
+            rows = tap_query(IRSA_TAP, build(base_cols), timeout=60)
+        except Exception as e:
+            log.warning("WISE query failed: %s", e)
+            return jsonify(error=f"WISE unavailable: {e}", sources=[]), 502
+
+    sources = []
+    for row in rows:
+        try:
+            sources.append({
+                "designation": row["designation"],
+                "ra": float(row["ra"]), "dec": float(row["dec"]),
+                "w1": f_or_none(row.get("w1mpro")),
+                "w2": f_or_none(row.get("w2mpro")),
+                "pmra": f_or_none(row.get("pmra")) or 0.0,
+                "pmdec": f_or_none(row.get("pmdec")) or 0.0,
+                "sigpmra": f_or_none(row.get("sigpmra")),
+                "sigpmdec": f_or_none(row.get("sigpmdec")),
+            })
+        except (KeyError, ValueError):
+            continue
+    return jsonify(sources=sources)
 
 
 # --------------------------------------------------------------------------
