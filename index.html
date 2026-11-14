@@ -275,11 +275,8 @@
         <div class="h-52 w-full pt-2">
           <canvas id="sedChart"></canvas>
         </div>
-        <div class="flex justify-between text-[10px] text-slate-500 pt-1">
-          <span>0.75 µm (Ближній ІЧ)</span>
-          <span>1.4/1.9 µm (H₂O)</span>
-          <span>3.3 µm (CH₄)</span>
-          <span>5.0 µm (CO)</span>
+        <div class="text-[10px] text-slate-500 pt-1">
+          Характерні смуги: H₂O ≈ 1.4 і 1.9 µm · CH₄ ≈ 3.3 µm · CO ≈ 4.6 µm (діапазон SPHEREx 0.75–5.0 µm)
         </div>
       </div>
 
@@ -311,6 +308,9 @@
     let currentFov = 0.06;
     let selectedClickCoords = null;
     let sedChartInstance = null;
+    let sedRequestId = 0;   // захист від гонки відповідей /api/sed
+    let skyRequestId = 0;   // захист від гонки відповідей при частих «Завантажити»
+    let pendingTitle = null; // назва пресета для наступного завантаження
 
     // Парсинг координат (підтримує десяткові градуси та формат HMS/DMS)
     function parseCoordinate(val, isRa = false) {
@@ -323,7 +323,8 @@
         const min = parseFloat(match[2]);
         const sec = parseFloat(match[3]);
         let decimal = sign * (degOrHr + min / 60 + sec / 3600);
-        if (isRa && /[hH]/.test(val)) decimal *= 15.0;
+        // RA у форматі h:m:s (з буквою h або без d і < 24) — це години
+        if (isRa && (/[hH]/.test(val) || (!/[dD]/.test(val) && degOrHr < 24))) decimal *= 15.0;
         return decimal;
       }
       return parseFloat(val);
@@ -342,7 +343,8 @@
           document.getElementById('fovInput').value = params.get('fov');
           document.getElementById('fovLabel').textContent = parseFloat(params.get('fov')).toFixed(2) + '°';
         }
-        document.getElementById('targetTitle').textContent = `Custom Sky (${params.get('ra')}, ${params.get('dec')})`;
+      } else {
+        pendingTitle = 'WISE 0855 (Brown Dwarf)';  // стартові координати збігаються з цим пресетом
       }
       if (params.has('band')) {
         document.getElementById('bandSelect').value = params.get('band');
@@ -356,7 +358,7 @@
       document.getElementById('decInput').value = dec;
       document.getElementById('fovInput').value = fov;
       document.getElementById('fovLabel').textContent = fov.toFixed(2) + '°';
-      document.getElementById('targetTitle').textContent = label;
+      pendingTitle = label;
       fetchSkyData();
     }
 
@@ -394,6 +396,10 @@
       currentFov = fov;
       selectedClickCoords = { ra, dec };
       updateUrlParams(ra, dec, fov, band);
+      document.getElementById('targetTitle').textContent =
+        pendingTitle || `Custom Sky (${ra.toFixed(5)}, ${dec.toFixed(5)})`;
+      pendingTitle = null;
+      const myRequest = ++skyRequestId;
 
       const loader = document.getElementById('loaderOverlay');
       loader.classList.remove('hidden');
@@ -409,8 +415,9 @@
 
         if (!cutoutsRes.ok) throw new Error(await cutoutsRes.text());
         const cutoutsData = await cutoutsRes.json();
+        if (myRequest !== skyRequestId) return;  // користувач уже запустив новий запит
 
-        epochs = (cutoutsData.epochs || []).filter(e => e.image);
+        epochs =(cutoutsData.epochs || []).filter(e => e.image);
         stackData = cutoutsData.stack && cutoutsData.stack.image ? cutoutsData.stack : null;
         currentFrameIndex = 0;
         // У режимі «Авто» показуємо, який детектор обрав бекенд
@@ -420,30 +427,42 @@
         if (epochs.length === 0 && band) {
           document.getElementById('epochMeta').textContent =
             `Для ${band} немає знімків у цій точці — спробуйте інший детектор або «Авто».`;
+        } else if (epochs.length === 0 && cutoutsData.note) {
+          document.getElementById('epochMeta').textContent = cutoutsData.note;
         }
         buildFrameButtons();
         updateFrameDisplay();
         restartBlinkTimer();
 
+        // Скидаємо старі каталоги, щоб при збої не лишалися маркери попередньої цілі
+        gaiaStars = [];
         if (gaiaRes.ok) {
           const gaiaData = await gaiaRes.json();
+          if (myRequest !== skyRequestId) return;
           gaiaStars = gaiaData.stars || [];
-          renderGaiaOverlay();
         }
+        renderGaiaOverlay();
 
         wiseSources = [];
         if (wiseRes && wiseRes.ok) {
           const wiseData = await wiseRes.json();
+          if (myRequest !== skyRequestId) return;
           wiseSources = wiseData.sources || [];
         }
         renderWiseOverlay();
 
         fetchSed(ra, dec);
       } catch (err) {
+        if (myRequest !== skyRequestId) return;
         console.error(err);
+        // Не лишаємо на екрані кадри попередньої цілі
+        epochs = [];
+        stackData = null;
+        buildFrameButtons();
+        updateFrameDisplay();
         document.getElementById('epochMeta').textContent = 'Помилка завантаження даних SPHEREx: ' + err.message;
       } finally {
-        loader.classList.add('hidden');
+        if (myRequest === skyRequestId) loader.classList.add('hidden');
       }
     }
 
@@ -829,7 +848,7 @@
             borderWidth: 2,
             pointRadius: 3,
             fill: true,
-            tension: 0.25
+            tension: 0
           }]
         },
         options: {
@@ -838,6 +857,7 @@
           plugins: { legend: { display: false } },
           scales: {
             x: {
+              type: 'linear', min: 0.7, max: 5.1,
               title: { display: true, text: 'Довжина хвилі (µm)', color: '#94a3b8', font: { size: 10 } },
               ticks: { color: '#64748b', font: { size: 10 } },
               grid: { color: '#1e293b' }
@@ -859,10 +879,12 @@
     async function fetchSed(ra, dec) {
       const sub = document.getElementById('sedSubtitle');
       sub.textContent = `Запит спектру для RA ${ra.toFixed(4)}°, Dec ${dec.toFixed(4)}°...`;
+      const token = ++sedRequestId;
 
       try {
         const res = await fetch(`/api/sed?ra=${ra}&dec=${dec}`);
         const data = await res.json();
+        if (token !== sedRequestId) return;  // прийшла застаріла відповідь
 
         if (!data.found || !data.bands || data.bands.length === 0) {
           sub.textContent = `Спектральних даних у точці (${ra.toFixed(4)}, ${dec.toFixed(4)}) не знайдено.`;
@@ -873,8 +895,9 @@
         }
 
         sub.textContent = `Джерело: ${data.designation || 'SPHEREx Source'} (${data.bands.length} каналів)`;
-        sedChartInstance.data.labels = data.bands.map(b => b.wavelength_um);
-        sedChartInstance.data.datasets[0].data = data.bands.map(b => b.flux_mjy);
+        // Лінійна вісь X: точки стоять за реальною довжиною хвилі, а не рівномірно
+        sedChartInstance.data.labels = [];
+        sedChartInstance.data.datasets[0].data = data.bands.map(b => ({ x: b.wavelength_um, y: b.flux_mjy }));
         sedChartInstance.update();
       } catch (e) {
         sub.textContent = 'Помилка побудови спектру SED.';
@@ -897,11 +920,11 @@
         container.innerHTML = list.map(item => `
           <div class="bg-slate-950 border border-slate-800 rounded-lg p-2.5 space-y-1">
             <div class="flex justify-between items-center">
-              <span class="font-semibold text-emerald-400">${item.type}</span>
-              <span class="text-[10px] text-slate-500">${item.date}</span>
+              <span class="font-semibold text-emerald-400">${escHtml(item.type)}</span>
+              <span class="text-[10px] text-slate-500">${escHtml(item.date)}</span>
             </div>
-            <div class="font-mono text-[11px] text-slate-300">${item.coords}</div>
-            <div class="text-[10px] text-slate-400">Спостерігач: ${item.observer} • Зміщення: ${item.displacement}</div>
+            <div class="font-mono text-[11px] text-slate-300">${escHtml(item.coords)}</div>
+            <div class="text-[10px] text-slate-400">Спостерігач: ${escHtml(item.observer)} • Режим: ${escHtml(item.displacement)}</div>
           </div>
         `).join('');
       } catch (e) {
@@ -918,7 +941,7 @@
         observer: document.getElementById('observerName').value || 'Anonymous',
         type: document.getElementById('candidateType').value,
         coords: `${ra.toFixed(5)}°, ${dec.toFixed(5)}°`,
-        displacement: document.getElementById('diffToggle').checked ? 'Виявлено диполь (Diff)' : 'Візуально (Blink)',
+        displacement: document.getElementById('diffToggle').checked ? 'Перегляд: Diff' : 'Перегляд: Blink',
         distance: `FOV ${currentFov.toFixed(2)}°`,
         date: new Date().toISOString().split('T')[0]
       };
@@ -931,6 +954,8 @@
 
       if (res.ok) {
         loadDiscoveries();
+      } else {
+        alert('Не вдалося записати відкриття (код ' + res.status + ').');
       }
     }
   </script>
