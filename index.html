@@ -99,6 +99,20 @@
                  class="w-full accent-cyan-400" />
         </div>
 
+        <div>
+          <label class="block text-xs text-slate-400 mb-1">Детектор SPHEREx (діапазон довжин хвиль)</label>
+          <select id="bandSelect"
+                  class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-cyan-500">
+            <option value="">Авто (найбільше повторних візитів)</option>
+            <option value="SPHEREx-D1">D1 · 0.75–1.11 µm</option>
+            <option value="SPHEREx-D2">D2 · 1.11–1.64 µm</option>
+            <option value="SPHEREx-D3">D3 · 1.64–2.42 µm</option>
+            <option value="SPHEREx-D4">D4 · 2.42–3.82 µm</option>
+            <option value="SPHEREx-D5">D5 · 3.82–4.42 µm</option>
+            <option value="SPHEREx-D6">D6 · 4.42–5.00 µm</option>
+          </select>
+        </div>
+
         <div class="flex items-center justify-between pt-1">
           <label class="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
             <input id="invertCheck" type="checkbox" checked class="accent-cyan-400 rounded" />
@@ -301,6 +315,9 @@
         }
         document.getElementById('targetTitle').textContent = `Custom Sky (${params.get('ra')}, ${params.get('dec')})`;
       }
+      if (params.has('band')) {
+        document.getElementById('bandSelect').value = params.get('band');
+      }
       fetchSkyData();
     });
 
@@ -315,11 +332,13 @@
     }
 
     // Синхронізація координат в URL (для шерінгу та embed)
-    function updateUrlParams(ra, dec, fov) {
+    function updateUrlParams(ra, dec, fov, band = '') {
       const url = new URL(window.location);
       url.searchParams.set('ra', ra.toFixed(5));
       url.searchParams.set('dec', dec.toFixed(5));
       url.searchParams.set('fov', fov.toFixed(2));
+      if (band) url.searchParams.set('band', band);
+      else url.searchParams.delete('band');
       window.history.replaceState({}, '', url);
     }
 
@@ -334,6 +353,7 @@
       const dec = parseCoordinate(document.getElementById('decInput').value, false);
       const fov = parseFloat(document.getElementById('fovInput').value);
       const invert = document.getElementById('invertCheck').checked;
+      const band = document.getElementById('bandSelect').value;
 
       if (isNaN(ra) || isNaN(dec)) {
         alert('Некоректний формат координат RA або Dec.');
@@ -344,7 +364,7 @@
       currentDec = dec;
       currentFov = fov;
       selectedClickCoords = { ra, dec };
-      updateUrlParams(ra, dec, fov);
+      updateUrlParams(ra, dec, fov, band);
 
       const loader = document.getElementById('loaderOverlay');
       loader.classList.remove('hidden');
@@ -352,7 +372,8 @@
       try {
         // Паралельно запитуємо знімки SPHEREx, зірки Gaia DR3 та спектр центру
         const [cutoutsRes, gaiaRes] = await Promise.all([
-          fetch(`/api/cutouts?ra=${ra}&dec=${dec}&radius_deg=${fov}&invert=${invert}`),
+          fetch(`/api/cutouts?ra=${ra}&dec=${dec}&radius_deg=${fov}&invert=${invert}` +
+                (band ? `&band=${encodeURIComponent(band)}` : '')),
           fetch(`/api/gaia?ra=${ra}&dec=${dec}&radius_deg=${fov}`)
         ]);
 
@@ -361,6 +382,14 @@
 
         epochs = (cutoutsData.epochs || []).filter(e => e.image);
         currentFrameIndex = 0;
+        // У режимі «Авто» показуємо, який детектор обрав бекенд
+        if (!band && cutoutsData.band) {
+          document.getElementById('bandSelect').title = `Авто → ${cutoutsData.band}`;
+        }
+        if (epochs.length === 0 && band) {
+          document.getElementById('epochMeta').textContent =
+            `Для ${band} немає знімків у цій точці — спробуйте інший детектор або «Авто».`;
+        }
         buildFrameButtons();
         updateFrameDisplay();
         restartBlinkTimer();
